@@ -30,6 +30,8 @@ func Initialize(filePath string) (err error) {
 		fmt.Printf("%s has IP %s\n", iface.Name, prefixForm.String())
 		// CreateInterface()
 	}
+	// CreateForwardingTable(lnxConfig.Neighbors)
+
 	return nil
 }
 
@@ -68,8 +70,13 @@ func interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 	}
 }
 
-func CreateForwardingTable() {
-
+// TODO: neighbor name vs neighbor config?
+func CreateForwardingTable(neighbors []lnxconfig.NeighborConfig) map[lnxconfig.NeighborConfig]string {
+	forwardingTable := make(map[lnxconfig.NeighborConfig]string)
+	for _, neighbor := range neighbors {
+		forwardingTable[neighbor] = neighbor.InterfaceName
+	}
+	return forwardingTable
 }
 
 func GetNeighborList() {
