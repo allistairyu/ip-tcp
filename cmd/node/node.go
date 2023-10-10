@@ -1,10 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
+
+	"github.com/brown-cs1680-f23/iptcp-luke-allistair/pkg/lnxconfig"
 )
 
 type neighbor struct {
@@ -23,13 +25,16 @@ func Initialize(filePath string) (err error) {
 	}
 	defer file.Close()
 
-	// read from file line by line
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		fmt.Println(scanner.Text())
+	// Parse the file
+	lnxConfig, err := lnxconfig.ParseConfig(filePath)
+	if err != nil {
+		panic(err)
 	}
-	if err := scanner.Err(); err != nil {
-		return errors.New("scanner fail")
+
+	// Demo:  print out the IP for each interface in this config
+	for _, iface := range lnxConfig.Interfaces {
+		prefixForm := netip.PrefixFrom(iface.AssignedIP, iface.AssignedPrefix.Bits())
+		fmt.Printf("%s has IP %s\n", iface.Name, prefixForm.String())
 	}
 	return nil
 }
