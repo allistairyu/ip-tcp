@@ -19,7 +19,7 @@ type Node struct {
 	neighbors       []lnxconfig.NeighborConfig
 	interfaces      []lnxconfig.InterfaceConfig
 	forwardingTable map[netip.Addr]lnxconfig.NeighborConfig
-	handlerTable    map[uint8]HandlerFunc
+	handlerTable    map[int]HandlerFunc
 
 	// TODO: is there a less stupid way to do this...
 	enableMtxs  map[string]*sync.Mutex
@@ -29,7 +29,7 @@ type Node struct {
 
 type Packet []byte
 
-type HandlerFunc func(*Packet)
+type HandlerFunc func(Packet)
 
 const (
 	MaxMessageSize = 1400
@@ -48,7 +48,7 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 		node.neighbors = append(node.neighbors, neighbor)
 	}
 	node.createForwardingTable(lnxConfig.Neighbors)
-	node.handlerTable = make(map[uint8]HandlerFunc)
+	node.handlerTable = make(map[int]HandlerFunc)
 	node.enableMtxs = make(map[string]*sync.Mutex)
 	node.enableConds = make(map[string]*sync.Cond)
 	node.enabled = make(map[string]bool)
@@ -107,16 +107,34 @@ OUTER:
 		headerBytes := buffer[:headerSize]
 		checksumFromHeader := uint16(header.Checksum)
 		computedChecksum := ValidateChecksum(headerBytes, checksumFromHeader)
+		protocolNum := header.Protocol
 		if computedChecksum == checksumFromHeader {
+			header.Checksum = int(computedChecksum)
+
 			if header.Dst == node.addr {
 				message := buffer[headerSize:]
 				os.Stdout.Write(message)
+				node.handlerTable[protocolNum](buffer) //TODO: pass in buffer?
 			} else {
 				// longest prefix match in forwarding table
-				// TODO:
-				prefix := iface.AssignedPrefix
-
+				prefix := iface.AssignedPrefix // TODO: right?
+				longest := -1
+				var longestPrefixMatch netip.Addr
+				for addr, _ := range node.forwardingTable {
+					if prefix.Contains(addr) {
+						if prefix.Bits() > longest {
+							longest = prefix.Bits()
+							longestPrefixMatch = addr
+						}
+					}
+				}
+				if longest == -1 {
+					// TODO: should never get here... right
+				}
+				node.SendIP(longestPrefixMatch, protocolNum, buffer) // TODO: pass in buffer?
 			}
+		} else {
+			// drop packet. print message?
 		}
 	}
 }
@@ -194,7 +212,7 @@ func (node *Node) SendIP(dst netip.Addr, protocolNum int, data []byte) (err erro
 	return
 }
 
-func (node *Node) RegisterHandler(protocolNum uint8, callback HandlerFunc) {
+func (node *Node) RegisterHandler(protocolNum int, callback HandlerFunc) {
 	node.handlerTable[protocolNum] = callback
 }
 
