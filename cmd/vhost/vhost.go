@@ -23,5 +23,5 @@ func main() {
 		return
 	}
 	host, err := node.Initialize(lnxConfig)
-
+	host.repl()
 }

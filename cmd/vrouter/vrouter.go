@@ -23,5 +23,5 @@ func main() {
 		return
 	}
 	router, err := node.Initialize(lnxConfig)
-
+	router.repl()
 }

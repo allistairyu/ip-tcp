@@ -1,11 +1,13 @@
 package node
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 
 	ipv4header "iptcp/pkg/iptcp-headers"
@@ -50,6 +52,7 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	node.enableMtxs = make(map[string]*sync.Mutex)
 	node.enableConds = make(map[string]*sync.Cond)
 	node.enabled = make(map[string]bool)
+	node.handlerTable[0] = func(p Packet) { os.Stdout.Write(p) }
 	return
 }
 
@@ -217,18 +220,26 @@ func (node *Node) GetNeighborList() []lnxconfig.NeighborConfig {
 	return node.neighbors
 }
 
-func (node *Node) EnableInterface(name string) {
+func (node *Node) EnableInterface(name string) error {
+	if _, ok := node.enabled[name]; !ok {
+		return fmt.Errorf("%s not a valid interface\n", name)
+	}
 	node.enableMtxs[name].Lock()
 	node.enabled[name] = true
 	node.enableConds[name].Broadcast()
 	node.enableMtxs[name].Unlock()
+	return nil
 }
 
-func (node *Node) DisableInterface(name string) {
+func (node *Node) DisableInterface(name string) error {
+	if _, ok := node.enabled[name]; !ok {
+		return fmt.Errorf("%s not a valid interface", name)
+	}
 	node.enableMtxs[name].Lock()
 	node.enabled[name] = false
 	node.enableConds[name].Broadcast()
 	node.enableMtxs[name].Unlock()
+	return nil
 }
 
 func ValidateChecksum(b []byte, fromHeader uint16) uint16 {
@@ -240,4 +251,56 @@ func ComputeChecksum(b []byte) uint16 {
 	checksum := header.Checksum(b, 0)
 	checksumInv := checksum ^ 0xffff
 	return checksumInv
+}
+
+func (node *Node) repl() {
+	reader := bufio.NewScanner(os.Stdin)
+	fmt.Print("> ")
+	for reader.Scan() {
+		command := cleanInput(reader.Text())
+
+		tokens := strings.Split(command, " ")
+		switch tokens[0] {
+		case "li":
+			node.printInterfaces()
+		case "ln":
+			node.printNeighbors()
+		case "lr":
+			// TODO:
+		case "down":
+			err := node.DisableInterface(tokens[1])
+			if err != nil {
+				fmt.Println("Invalid interface")
+			}
+		case "up":
+			err := node.EnableInterface(tokens[1])
+			if err != nil {
+				fmt.Println("Invalid interface")
+			}
+		case "send":
+			if len(tokens) != 3 {
+				fmt.Println("send usage: send <addr> <message ...>")
+			}
+			node.SendIP(netip.MustParseAddr(tokens[1]), 0, []byte(tokens[2])) // TODO: idk
+		default:
+
+		}
+		fmt.Print("> ")
+	}
+}
+
+func cleanInput(text string) string {
+	output := strings.TrimSpace(text)
+	output = strings.ToLower(output)
+	return output
+}
+
+func (node *Node) printInterfaces() {
+	fmt.Println("Name\tAddr/Prefix\tState")
+	fmt.Println("interfaces") // TODO: printf formatting alignment stuff
+}
+
+func (node *Node) printNeighbors() {
+	fmt.Println("Iface\tVIP\tUDPAddr")
+	fmt.Println("neighbors") // TODO: printf formatting alignment stuff
 }
