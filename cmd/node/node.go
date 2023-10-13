@@ -44,9 +44,7 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 		node.interfaces = append(node.interfaces, iface)
 		go node.interfaceRoutine(iface)
 	}
-	for _, neighbor := range lnxConfig.Neighbors {
-		node.neighbors = append(node.neighbors, neighbor)
-	}
+	node.neighbors = lnxconfig.LnxConfig.Neighbors
 	node.createForwardingTable(lnxConfig.Neighbors)
 	node.handlerTable = make(map[int]HandlerFunc)
 	node.enableMtxs = make(map[string]*sync.Mutex)
@@ -75,7 +73,7 @@ func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 OUTER:
 	for {
 		buffer := make([]byte, MaxMessageSize) // max IP packet size of 1400 bytes
-		bytesRead, sourceAddr, err := conn.ReadFromUDP(buffer)
+		_, _, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Panicln("Error reading from UDP socket ", err)
 		}
@@ -97,7 +95,6 @@ OUTER:
 			fmt.Println("Error parsing header", err)
 			continue
 		}
-		// TODO: order of decrementing TTL and checksum?
 		header.TTL--
 		if header.TTL <= 0 {
 			continue
