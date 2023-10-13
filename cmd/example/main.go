@@ -5,7 +5,7 @@ import (
 	"net/netip"
 	"os"
 
-	"github.com/brown-cs1680-f23/iptcp-luke-allistair/pkg/lnxconfig"
+	"iptcp/pkg/lnxconfig"
 )
 
 func main() {
