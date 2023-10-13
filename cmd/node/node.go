@@ -115,6 +115,7 @@ OUTER:
 				// longest prefix match in forwarding table
 				// TODO:
 				prefix := iface.AssignedPrefix
+
 			}
 		}
 	}
@@ -128,20 +129,68 @@ func (node *Node) createForwardingTable(neighbors []lnxconfig.NeighborConfig) {
 	node.forwardingTable = forwardingTable
 }
 
-func (node *Node) SendIP(dst netip.Addr, protocolNum uint8, data []byte) (err error) {
-	// TODO: create IPV4 header
-	// marshall stuff?
-
-	// send via UDP to dst
-	conn, err := net.Dial("udp4", "127.0.0.1:6666")
-	if err != nil {
-		panic(err)
+func (node *Node) SendIP(dst netip.Addr, protocolNum int, data []byte) (err error) {
+	// https://github.com/brown-csci1680/lecture-examples/blob/main/ip-demo/cmd/udp-ip-send/main.go
+	hdr := ipv4header.IPv4Header{
+		Version:  4,
+		Len:      20, // Header length is always 20 when no IP options
+		TOS:      0,
+		TotalLen: ipv4header.HeaderLen + len(data),
+		ID:       0,
+		Flags:    0,
+		FragOff:  0,
+		TTL:      16,
+		Protocol: protocolNum,
+		Checksum: 0, // Should be 0 until checksum is computed
+		Src:      netip.MustParseAddr(node.addr.String()),
+		Dst:      netip.MustParseAddr(dst.String()),
+		Options:  []byte{},
 	}
 
-	_, err = conn.Write([]byte("Hello world!"))
+	// Assemble the header into a byte array
+	headerBytes, err := hdr.Marshal()
 	if err != nil {
-		panic(err)
+		log.Fatalln("Error marshalling header:  ", err)
 	}
+
+	// Compute the checksum (see below)
+	// Cast back to an int, which is what the Header structure expects
+	hdr.Checksum = int(ComputeChecksum(headerBytes))
+
+	headerBytes, err = hdr.Marshal()
+	if err != nil {
+		log.Fatalln("Error marshalling header:  ", err)
+	}
+
+	bytesToSend := make([]byte, 0, len(headerBytes)+len(data))
+	bytesToSend = append(bytesToSend, headerBytes...)
+	bytesToSend = append(bytesToSend, data...)
+
+	// TODO: UDP stuff
+	/*
+		bindAddrString := fmt.Sprintf(":%s", bindPort)
+		bindLocalAddr, err := net.ResolveUDPAddr("udp4", bindAddrString)
+		if err != nil {
+			log.Panicln("Error resolving address:  ", err)
+		}
+
+		// Turn the address string into a UDPAddr for the connection
+		addrString := fmt.Sprintf("%s:%s", address, port)
+		remoteAddr, err := net.ResolveUDPAddr("udp4", addrString)
+		if err != nil {
+			log.Panicln("Error resolving address:  ", err)
+		}
+
+		fmt.Printf("Sending to %s:%d\n",
+			remoteAddr.IP.String(), remoteAddr.Port)
+
+		// Bind on the local UDP port:  this sets the source port
+		// and creates a conn
+		conn, err := net.ListenUDP("udp4", bindLocalAddr)
+		if err != nil {
+			log.Panicln("Dial: ", err)
+		}
+	*/
 	return
 }
 
@@ -169,6 +218,11 @@ func (node *Node) DisableInterface(name string) {
 
 func ValidateChecksum(b []byte, fromHeader uint16) uint16 {
 	checksum := header.Checksum(b, fromHeader)
-
 	return checksum
+}
+
+func ComputeChecksum(b []byte) uint16 {
+	checksum := header.Checksum(b, 0)
+	checksumInv := checksum ^ 0xffff
+	return checksumInv
 }
