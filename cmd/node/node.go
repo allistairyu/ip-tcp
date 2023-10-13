@@ -6,19 +6,20 @@ import (
 	"net"
 	"net/netip"
 
+	ipv4header "github.com/brown-cs1680-f23/iptcp-luke-allistair/pkg/iptcp-headers"
 	"github.com/brown-cs1680-f23/iptcp-luke-allistair/pkg/lnxconfig"
 )
 
-type neighbor struct {
-	ipAddr  int32  // TODO: ?
-	udpAddr int32  // TODO: ?
-	name    string // TODO ?
+type Node struct {
+	addr       netip.Addr
+	neighbors  []lnxconfig.NeighborConfig
+	interfaces []lnxconfig.InterfaceConfig
 }
 
 /*
  * Read LNX file and initialize neighbors, table, etc.
  */
-func Initialize(filePath string) (err error) {
+func Initialize(filePath string) (node *Node, err error) {
 	// Parse the file
 	lnxConfig, err := lnxconfig.ParseConfig(filePath)
 	if err != nil {
@@ -32,12 +33,7 @@ func Initialize(filePath string) (err error) {
 	}
 	// CreateForwardingTable(lnxConfig.Neighbors)
 
-	return nil
-}
-
-func CreateInterface() {
-
-	// go interfaceRoutine()
+	return
 }
 
 // type InterfaceConfig struct {
@@ -63,18 +59,28 @@ func interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 		if err != nil {
 			log.Panicln("Error reading from UDP socket ", err)
 		}
-		// TODO: parse packet: check sum, decrement TTL
+		// TODO: IP in UDP example
+		header, err := ipv4header.ParseHeader(buffer)
+		// TODO: parse packet: check sum
 
-		// if this node is destination, print message
-		// else use forwarding table to route packet
+		// TODO: check if current host is destination
+		if header.Dst == nil {
+			// print message
+		} else {
+			header.TTL--
+			if header.TTL <= 0 {
+				// drop
+			} else {
+				// longest prefix match in forwarding table
+			}
+		}
 	}
 }
 
-// TODO: neighbor name vs neighbor config?
-func CreateForwardingTable(neighbors []lnxconfig.NeighborConfig) map[lnxconfig.NeighborConfig]string {
-	forwardingTable := make(map[lnxconfig.NeighborConfig]string)
+func CreateForwardingTable(neighbors []lnxconfig.NeighborConfig) map[netip.Addr]lnxconfig.NeighborConfig {
+	forwardingTable := make(map[netip.Addr]lnxconfig.NeighborConfig)
 	for _, neighbor := range neighbors {
-		forwardingTable[neighbor] = neighbor.InterfaceName
+		forwardingTable[neighbor.DestAddr] = neighbor
 	}
 	return forwardingTable
 }
