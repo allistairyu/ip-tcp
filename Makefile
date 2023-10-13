@@ -1,6 +1,7 @@
 
 all:
-	go build ./cmd/example
+	go build ./cmd/vhost
+	go build ./cmd/vrouter
 
 clean:
 	rm -fv example
