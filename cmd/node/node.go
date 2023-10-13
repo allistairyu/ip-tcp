@@ -5,45 +5,39 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 
 	ipv4header "github.com/brown-cs1680-f23/iptcp-luke-allistair/pkg/iptcp-headers"
 	"github.com/brown-cs1680-f23/iptcp-luke-allistair/pkg/lnxconfig"
 )
 
 type Node struct {
-	addr       netip.Addr
-	neighbors  []lnxconfig.NeighborConfig
-	interfaces []lnxconfig.InterfaceConfig
+	addr            netip.Addr
+	neighbors       []lnxconfig.NeighborConfig
+	interfaces      []lnxconfig.InterfaceConfig
+	forwardingTable map[netip.Addr]lnxconfig.NeighborConfig
+	enableChan      chan bool
 }
 
 /*
- * Read LNX file and initialize neighbors, table, etc.
+ * Initialize neighbors, table, etc.
  */
-func Initialize(filePath string) (node *Node, err error) {
-	// Parse the file
-	lnxConfig, err := lnxconfig.ParseConfig(filePath)
-	if err != nil {
-		panic(err)
-	}
-
+func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
+	node = new(Node)
 	for _, iface := range lnxConfig.Interfaces {
-		prefixForm := netip.PrefixFrom(iface.AssignedIP, iface.AssignedPrefix.Bits())
-		fmt.Printf("%s has IP %s\n", iface.Name, prefixForm.String())
-		// CreateInterface()
+		node.interfaces = append(node.interfaces, iface)
+		go node.interfaceRoutine(iface)
 	}
-	// CreateForwardingTable(lnxConfig.Neighbors)
-
+	for _, neighbor := range lnxConfig.Neighbors {
+		node.neighbors = append(node.neighbors, neighbor)
+	}
+	node.enableChan = make(chan bool)
+	node.CreateForwardingTable(lnxConfig.Neighbors)
 	return
 }
 
-// type InterfaceConfig struct {
-// 	Name           string
-// 	AssignedIP     netip.Addr
-// 	AssignedPrefix netip.Prefix
-
-//		UDPAddr netip.AddrPort
-//	}
-func interfaceRoutine(iface lnxconfig.InterfaceConfig) {
+func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
+	defer close(node.enableChan)
 	listenString := fmt.Sprintf(":%s", iface.UDPAddr) // TODO: tf is listenstring
 	listenAddr, err := net.ResolveUDPAddr("udp4", listenString)
 	if err != nil {
@@ -53,19 +47,29 @@ func interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 	if err != nil {
 		log.Panicln("Could not bind to UDP port: ", err)
 	}
+
+	enabled := true
+OUTER: // https://relistan.com/continue-statement-with-labels-in-go
 	for {
-		buffer := make([]byte, 100) // TODO: max IP packet size?
+		buffer := make([]byte, 1400) // max IP packet size of 1400 bytes
 		bytesRead, sourceAddr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Panicln("Error reading from UDP socket ", err)
 		}
+
+		for !enabled {
+			enabled = <-node.enableChan
+			if enabled {
+				continue OUTER // start reading from UDP socket again
+			}
+		}
+
 		// TODO: IP in UDP example
 		header, err := ipv4header.ParseHeader(buffer)
 		// TODO: parse packet: check sum
 
-		// TODO: check if current host is destination
-		if header.Dst == nil {
-			// print message
+		if header.Dst == node.addr {
+			os.Stdout.Write(buffer)
 		} else {
 			header.TTL--
 			if header.TTL <= 0 {
@@ -77,22 +81,22 @@ func interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 	}
 }
 
-func CreateForwardingTable(neighbors []lnxconfig.NeighborConfig) map[netip.Addr]lnxconfig.NeighborConfig {
+func (node *Node) CreateForwardingTable(neighbors []lnxconfig.NeighborConfig) {
 	forwardingTable := make(map[netip.Addr]lnxconfig.NeighborConfig)
 	for _, neighbor := range neighbors {
 		forwardingTable[neighbor.DestAddr] = neighbor
 	}
-	return forwardingTable
+	node.forwardingTable = forwardingTable
 }
 
-func GetNeighborList() {
-
+func (node *Node) GetNeighborList() []lnxconfig.NeighborConfig {
+	return node.neighbors
 }
 
-func EnableInterface() {
-
+func (node *Node) EnableInterface() {
+	node.enableChan <- true
 }
 
-func DisableInterface() {
-
+func (node *Node) DisableInterface() {
+	node.enableChan <- false
 }
