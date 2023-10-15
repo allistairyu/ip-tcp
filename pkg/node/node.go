@@ -296,11 +296,20 @@ func cleanInput(text string) string {
 }
 
 func (node *Node) printInterfaces() {
-	fmt.Println("Name\tAddr/Prefix\tState")
-	fmt.Println("interfaces") // TODO: printf formatting alignment stuff
+	fmt.Println("Name  Addr/Prefix State")
+	for _, iface := range node.interfaces {
+		state := "down"
+		if node.enabled[iface.Name] {
+			state = "up"
+		}
+		fmt.Printf("%4s  %s %4s\n", iface.Name, iface.AssignedPrefix, state)
+	}
 }
 
 func (node *Node) printNeighbors() {
-	fmt.Println("Iface\tVIP\tUDPAddr")
-	fmt.Println("neighbors") // TODO: printf formatting alignment stuff
+	fmt.Println("Iface          VIP          UDPAddr")
+	for _, neighbor := range node.neighbors {
+		fmt.Printf("%4s    %9s  %15s\n", neighbor.InterfaceName, neighbor.DestAddr, neighbor.UDPAddr)
+	}
+	// fmt.Println("neighbors") // TODO: printf formatting alignment stuff
 }
