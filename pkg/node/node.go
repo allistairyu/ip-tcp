@@ -63,8 +63,8 @@ func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 	node.enableConds[iface.Name] = enableCond
 	node.enabled[iface.Name] = true
 
-	listenString := fmt.Sprintf(":%s", iface.UDPAddr)
-	listenAddr, err := net.ResolveUDPAddr("udp4", listenString)
+	// listenString := fmt.Sprintf(":%s", iface.UDPAddr)
+	listenAddr, err := net.ResolveUDPAddr("udp4", iface.UDPAddr.String())
 	if err != nil {
 		log.Panicln("Error resolving address:  ", err)
 	}
