@@ -82,15 +82,15 @@ OUTER:
 		}
 
 		// Check if interface is disabled
-		enableMutex.Lock()
+		node.enableMtxs[iface.Name].Lock()
 		for !node.enabled[iface.Name] {
-			enableCond.Wait()
+			node.enableConds[iface.Name].Wait()
 			if node.enabled[iface.Name] {
-				enableMutex.Unlock()
+				node.enableMtxs[iface.Name].Unlock()
 				continue OUTER // https://relistan.com/continue-statement-with-labels-in-go
 			}
 		}
-		enableMutex.Unlock()
+		node.enableMtxs[iface.Name].Unlock()
 
 		// https://github.com/brown-csci1680/lecture-examples/blob/main/ip-demo/cmd/udp-ip-recv/main.go#L107
 		header, err := ipv4header.ParseHeader(buffer)
