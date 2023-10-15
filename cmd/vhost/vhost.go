@@ -23,5 +23,8 @@ func main() {
 		return
 	}
 	host, err := node.Initialize(lnxConfig)
-	host.repl()
+	if err != nil {
+
+	}
+	host.REPL()
 }

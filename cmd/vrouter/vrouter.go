@@ -23,5 +23,8 @@ func main() {
 		return
 	}
 	router, err := node.Initialize(lnxConfig)
-	router.repl()
+	if err != nil {
+		// figure out when Initialize errors
+	}
+	router.REPL()
 }

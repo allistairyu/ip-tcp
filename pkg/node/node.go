@@ -253,7 +253,7 @@ func ComputeChecksum(b []byte) uint16 {
 	return checksumInv
 }
 
-func (node *Node) repl() {
+func (node *Node) REPL() {
 	reader := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
 	for reader.Scan() {
