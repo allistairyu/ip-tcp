@@ -27,6 +27,7 @@ type Node struct {
 	enableMtxs  map[string]*sync.Mutex
 	enableConds map[string]*sync.Cond
 	enabled     map[string]bool
+
 }
 
 type Packet []byte
@@ -209,6 +210,16 @@ func (node *Node) SendIP(dst netip.Addr, protocolNum int, data []byte) (err erro
 			log.Panicln("Dial: ", err)
 		}
 	*/
+	conn, err := net.Dial("udp4", dst.String())
+	if err != nil {
+		fmt.Printf("Error connecting to destination")
+
+	}
+	_, err = conn.Write(bytesToSend) // CHECK THIS IS RIGHT LATER, MIGHT NEED TO WRITE TO BUFFER??
+	if err != nil {
+		fmt.Printf("Error sending to destination")
+	}
+
 	return
 }
 
