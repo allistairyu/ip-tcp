@@ -291,8 +291,9 @@ func (node *Node) REPL() {
 		case "send":
 			if len(tokens) != 3 {
 				fmt.Println("send usage: send <addr> <message ...>")
+			} else {
+				node.SendIP(netip.MustParseAddr(tokens[1]), 0, []byte(tokens[2])) // TODO: idk
 			}
-			node.SendIP(netip.MustParseAddr(tokens[1]), 0, []byte(tokens[2])) // TODO: idk
 		default:
 
 		}
