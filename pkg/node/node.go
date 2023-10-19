@@ -18,6 +18,7 @@ import (
 type ForwardingInfo struct {
 	route_type   string
 	next         netip.Addr
+	pre          netip.Prefix
 	cost         int
 	last_updated int64
 	ifname       string
@@ -36,7 +37,7 @@ type Node struct {
 	interfaces       []lnxconfig.InterfaceConfig
 	interfaceSockets map[string]chan *sendInterface
 	neighborTable    map[netip.Addr]lnxconfig.NeighborConfig
-	forwardingTable  map[netip.Prefix]*ForwardingInfo
+	forwardingTable  []*ForwardingInfo
 	handlerTable     map[int]HandlerFunc
 
 	// TODO: is there a less stupid way to do this...
@@ -47,7 +48,7 @@ type Node struct {
 
 type Packet []byte
 
-type HandlerFunc func(Packet)
+type HandlerFunc func(Packet, *ipv4header.IPv4Header)
 
 const (
 	MaxMessageSize = 1400
@@ -63,7 +64,7 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	node.enableConds = make(map[string]*sync.Cond)
 	node.enabled = make(map[string]bool)
 	node.interfaceSockets = make(map[string]chan *sendInterface)
-	node.forwardingTable = make(map[netip.Prefix]*ForwardingInfo)
+	//node.forwardingTable = make([]*ForwardingInfo)
 
 	// fill interfaces, forwarding table
 	for _, iface := range lnxConfig.Interfaces {
@@ -71,10 +72,11 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 		info := &ForwardingInfo{
 			route_type: "L",
 			next:       iface.AssignedIP,
+			pre:        iface.AssignedPrefix,
 			cost:       0,
 			ifname:     iface.Name,
 		}
-		node.forwardingTable[iface.AssignedPrefix] = info
+		node.forwardingTable = append(node.forwardingTable, info)
 		sendChan := make(chan *sendInterface, 1)
 		node.interfaceSockets[iface.Name] = sendChan
 		go node.interfaceRoutine(iface)
@@ -83,16 +85,44 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	for pre, addr := range lnxConfig.StaticRoutes {
 		info := &ForwardingInfo{
 			route_type: "S",
+			pre:        pre,
 			next:       addr,
 			cost:       0,
 		}
-		node.forwardingTable[pre] = info
+		node.forwardingTable = append(node.forwardingTable, info)
 	}
 	node.createNeighborTable(lnxConfig.Neighbors)
 
+	for _, rip_neighbor := range lnxConfig.RipNeighbors {
+		iface := node.neighborTable[rip_neighbor].InterfaceName
+		for _, inter := range node.interfaces {
+			if inter.Name == iface {
+				pre := inter.AssignedPrefix
+				info := &ForwardingInfo{
+					route_type: "R",
+					next:       rip_neighbor,
+					pre:        pre,
+					cost:       -1,
+				}
+				node.forwardingTable = append(node.forwardingTable, info)
+				continue
+			}
+		}
+	}
+
 	// figure out what to do with this later
-	node.handlerTable[0] = func(p Packet) { os.Stdout.Write(p) }
+	node.handlerTable[0] = protocol0
+	node.handlerTable[200] = protocol200
 	return
+}
+
+func protocol0(message Packet, header *ipv4header.IPv4Header) {
+	fmt.Printf("Received test packet:  Src: %s, Dst: %s, TTL: %d, Data: %s\n", header.Src.String(), header.Dst.String(), header.TTL, string(message))
+}
+
+func protocol200(message Packet, header *ipv4header.IPv4Header) {
+	// handle rip packets...
+
 }
 
 func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
@@ -168,9 +198,7 @@ OUTER:
 			header.Checksum = int(computedChecksum)
 
 			if node.checkDest(header.Dst) { // check that we end here
-				message := buffer[headerSize:]
-				fmt.Printf("Received test packet:  Src: %s, Dst: %s, TTL: %d, Data: %s\n", header.Src.String(), header.Dst.String(), header.TTL, string(message))
-				//node.handlerTable[protocolNum](buffer) //TODO: pass in buffer?
+				node.handlerTable[protocolNum](buffer[headerSize:], header)
 			} else if header.TTL > 0 {
 				next_addr, found := node.findNext(header.Dst)
 				if !found {
@@ -239,7 +267,8 @@ func (node *Node) findNext(dst netip.Addr) (netip.Addr, bool) {
 	}
 	len := -1
 	var useForward *ForwardingInfo
-	for pre, forward := range node.forwardingTable {
+	for _, forward := range node.forwardingTable {
+		pre := forward.pre
 		if pre.Contains(dst) {
 			if pre.Bits() > len {
 				len = pre.Bits()
@@ -392,7 +421,7 @@ func (node *Node) REPL() {
 		case "ln":
 			node.printNeighbors()
 		case "lr":
-			// TODO:
+			node.printRoutes()
 		case "down":
 			if len(tokens) != 2 {
 				fmt.Println("down usage: down <ifname>")
@@ -451,5 +480,21 @@ func (node *Node) printNeighbors() {
 	fmt.Println("Iface          VIP          UDPAddr")
 	for _, neighbor := range node.neighbors {
 		fmt.Printf("%4s    %9s  %15s\n", neighbor.InterfaceName, neighbor.DestAddr, neighbor.UDPAddr)
+	}
+}
+
+func (node *Node) printRoutes() {
+	fmt.Println("T       Prefix     Next hop    Cost")
+	for _, info := range node.forwardingTable {
+		pre := info.pre
+		if info.route_type == "L" {
+			fmt.Printf("%s       %s     LOCAL:%s    %d\n", info.route_type, pre, info.ifname, info.cost)
+		} else if info.route_type == "R" {
+			if info.cost != -1 {
+				fmt.Printf("%s       %s     %s    %d\n", info.route_type, pre, info.next, info.cost)
+			}
+		} else {
+			fmt.Printf("%s       %s     %s    %d\n", info.route_type, pre, info.next, info.cost)
+		}
 	}
 }
