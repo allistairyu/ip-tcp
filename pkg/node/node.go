@@ -3,6 +3,8 @@ package node
 import (
 	"bufio"
 	"fmt"
+	ipv4header "iptcp/pkg/iptcp-headers"
+	"iptcp/pkg/lnxconfig"
 	"log"
 	"net"
 	"net/netip"
@@ -10,24 +12,37 @@ import (
 	"strings"
 	"sync"
 
-	ipv4header "iptcp/pkg/iptcp-headers"
-	"iptcp/pkg/lnxconfig"
-
 	"github.com/google/netstack/tcpip/header"
 )
 
+type ForwardingInfo struct {
+	route_type   string
+	next         netip.Addr
+	cost         int
+	last_updated int64
+	ifname       string
+
+	forwardLock sync.Mutex
+}
+
+type sendInterface struct {
+	pack    Packet
+	address netip.Addr
+}
+
 type Node struct {
-	addr            netip.Addr
-	neighbors       []lnxconfig.NeighborConfig
-	interfaces      []lnxconfig.InterfaceConfig
-	forwardingTable map[netip.Addr]lnxconfig.NeighborConfig
-	handlerTable    map[int]HandlerFunc
+	//addr            netip.Addr
+	neighbors        []lnxconfig.NeighborConfig
+	interfaces       []lnxconfig.InterfaceConfig
+	interfaceSockets map[string]chan *sendInterface
+	neighborTable    map[netip.Addr]lnxconfig.NeighborConfig
+	forwardingTable  map[netip.Prefix]*ForwardingInfo
+	handlerTable     map[int]HandlerFunc
 
 	// TODO: is there a less stupid way to do this...
 	enableMtxs  map[string]*sync.Mutex
 	enableConds map[string]*sync.Cond
 	enabled     map[string]bool
-
 }
 
 type Packet []byte
@@ -43,16 +58,39 @@ const (
  */
 func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	node = new(Node)
-	for _, iface := range lnxConfig.Interfaces {
-		node.interfaces = append(node.interfaces, iface)
-		go node.interfaceRoutine(iface)
-	}
-	node.neighbors = lnxconfig.LnxConfig.Neighbors
-	node.createForwardingTable(lnxConfig.Neighbors)
 	node.handlerTable = make(map[int]HandlerFunc)
 	node.enableMtxs = make(map[string]*sync.Mutex)
 	node.enableConds = make(map[string]*sync.Cond)
 	node.enabled = make(map[string]bool)
+	node.interfaceSockets = make(map[string]chan *sendInterface)
+	node.forwardingTable = make(map[netip.Prefix]*ForwardingInfo)
+
+	// fill interfaces, forwarding table
+	for _, iface := range lnxConfig.Interfaces {
+		node.interfaces = append(node.interfaces, iface)
+		info := &ForwardingInfo{
+			route_type: "L",
+			next:       iface.AssignedIP,
+			cost:       0,
+			ifname:     iface.Name,
+		}
+		node.forwardingTable[iface.AssignedPrefix] = info
+		sendChan := make(chan *sendInterface, 1)
+		node.interfaceSockets[iface.Name] = sendChan
+		go node.interfaceRoutine(iface)
+	}
+	node.neighbors = lnxConfig.Neighbors
+	for pre, addr := range lnxConfig.StaticRoutes {
+		info := &ForwardingInfo{
+			route_type: "S",
+			next:       addr,
+			cost:       0,
+		}
+		node.forwardingTable[pre] = info
+	}
+	node.createNeighborTable(lnxConfig.Neighbors)
+
+	// figure out what to do with this later
 	node.handlerTable[0] = func(p Packet) { os.Stdout.Write(p) }
 	return
 }
@@ -73,6 +111,21 @@ func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 	if err != nil {
 		log.Panicln("Could not bind to UDP port: ", err)
 	}
+
+	go func() {
+		// handle sends
+		for {
+			select {
+			case received := <-node.interfaceSockets[iface.Name]:
+				// want to send this
+				node.enableMtxs[iface.Name].Lock()
+				if node.enabled[iface.Name] {
+					node.forwardPacket(conn, received.address, received.pack)
+				}
+				node.enableMtxs[iface.Name].Unlock()
+			}
+		}
+	}()
 
 OUTER:
 	for {
@@ -100,7 +153,9 @@ OUTER:
 			continue
 		}
 		header.TTL--
-		if header.TTL <= 0 {
+
+		// this should never happen, but just in case
+		if header.TTL < 0 {
 			continue
 		}
 
@@ -112,44 +167,97 @@ OUTER:
 		if computedChecksum == checksumFromHeader {
 			header.Checksum = int(computedChecksum)
 
-			if header.Dst == node.addr {
+			if node.checkDest(header.Dst) { // check that we end here
 				message := buffer[headerSize:]
-				os.Stdout.Write(message)
-				node.handlerTable[protocolNum](buffer) //TODO: pass in buffer?
-			} else {
-				// longest prefix match in forwarding table
-				prefix := iface.AssignedPrefix // TODO: right?
-				longest := -1
-				var longestPrefixMatch netip.Addr
-				for addr, _ := range node.forwardingTable {
-					if prefix.Contains(addr) {
-						if prefix.Bits() > longest {
-							longest = prefix.Bits()
-							longestPrefixMatch = addr
-						}
-					}
+				fmt.Printf("Received test packet:  Src: %s, Dst: %s, TTL: %d, Data: %s\n", header.Src.String(), header.Dst.String(), header.TTL, string(message))
+				//node.handlerTable[protocolNum](buffer) //TODO: pass in buffer?
+			} else if header.TTL > 0 {
+				next_addr, found := node.findNext(header.Dst)
+				if !found {
+					fmt.Println("Error: No match in forwarding table.")
+				} else {
+					// send the packet to desired
+					data := makePacket(header.Src, header.Dst, protocolNum, header.TTL, buffer[headerSize:])
+					node.forwardPacket(conn, next_addr, data)
 				}
-				if longest == -1 {
-					// TODO: should never get here... right
-				}
-				node.SendIP(longestPrefixMatch, protocolNum, buffer) // TODO: pass in buffer?
 			}
 		} else {
-			// drop packet. print message?
+			fmt.Printf("Dropped packet, message from %s\n", iface.Name)
 		}
 	}
 }
 
-func (node *Node) createForwardingTable(neighbors []lnxconfig.NeighborConfig) {
-	forwardingTable := make(map[netip.Addr]lnxconfig.NeighborConfig)
-	for _, neighbor := range neighbors {
-		forwardingTable[neighbor.DestAddr] = neighbor
+// forward a given packet to nextAddr
+func (node *Node) forwardPacket(conn *net.UDPConn, nextAddr netip.Addr, p Packet) {
+	udpPort, found := node.neighborUDP(nextAddr)
+	remoteAddr, err := net.ResolveUDPAddr("udp4", udpPort.String())
+	if err != nil {
+		fmt.Println("error resolving udp address")
 	}
-	node.forwardingTable = forwardingTable
+	if !found {
+		fmt.Println("Destination VIP is not a known neighbor")
+	} else {
+		bytesWritten, err := conn.WriteToUDP(p, remoteAddr)
+		if err != nil {
+			fmt.Println("Error writing to socket")
+		}
+		fmt.Printf("Sent %d bytes\n", bytesWritten)
+	}
 }
 
-func (node *Node) SendIP(dst netip.Addr, protocolNum int, data []byte) (err error) {
-	// https://github.com/brown-csci1680/lecture-examples/blob/main/ip-demo/cmd/udp-ip-send/main.go
+// check if neighbor; if exists, return the udp port
+func (node *Node) neighborUDP(dst netip.Addr) (netip.AddrPort, bool) {
+	for _, neighbor := range node.neighbors {
+		if neighbor.DestAddr == dst {
+			return neighbor.UDPAddr, true
+		}
+	}
+	dummy, _ := netip.ParseAddrPort("127.0.0.1:1680")
+	return dummy, false
+}
+
+// check if destination corresponds to current node
+func (node *Node) checkDest(dst netip.Addr) bool {
+	for _, iface := range node.interfaces {
+		prefix := iface.AssignedPrefix
+		if prefix.Contains(dst) {
+			return true
+		}
+	}
+	return false
+}
+
+// return where to send packet next, error = not found in forwarding table
+func (node *Node) findNext(dst netip.Addr) (netip.Addr, bool) {
+	// first, check forwrarding table: if not there then err
+	// if it is, get next hop (depending on type)
+	// after this, check neighbor table / interface tables as needed
+
+	// first check local network, then go past if needed
+	if node.checkDest(dst) {
+		return dst, true
+	}
+	len := -1
+	var useForward *ForwardingInfo
+	for pre, forward := range node.forwardingTable {
+		if pre.Contains(dst) {
+			if pre.Bits() > len {
+				len = pre.Bits()
+				useForward = forward
+			}
+		}
+	}
+	if len == -1 {
+		// didnt find
+		dummy, _ := netip.ParseAddr("0.0.0.0")
+		return dummy, false
+	} else {
+		return useForward.next, true
+	}
+}
+
+// makes packet for given source, destination, protocol, TTL, data
+func makePacket(src netip.Addr, dst netip.Addr, protocolNum int, ttl int, data []byte) Packet {
 	hdr := ipv4header.IPv4Header{
 		Version:  4,
 		Len:      20, // Header length is always 20 when no IP options
@@ -158,10 +266,10 @@ func (node *Node) SendIP(dst netip.Addr, protocolNum int, data []byte) (err erro
 		ID:       0,
 		Flags:    0,
 		FragOff:  0,
-		TTL:      16,
+		TTL:      ttl,
 		Protocol: protocolNum,
 		Checksum: 0, // Should be 0 until checksum is computed
-		Src:      netip.MustParseAddr(node.addr.String()),
+		Src:      netip.MustParseAddr(src.String()),
 		Dst:      netip.MustParseAddr(dst.String()),
 		Options:  []byte{},
 	}
@@ -185,41 +293,43 @@ func (node *Node) SendIP(dst netip.Addr, protocolNum int, data []byte) (err erro
 	bytesToSend = append(bytesToSend, headerBytes...)
 	bytesToSend = append(bytesToSend, data...)
 
-	// TODO: UDP stuff
-	/*
-		bindAddrString := fmt.Sprintf(":%s", bindPort)
-		bindLocalAddr, err := net.ResolveUDPAddr("udp4", bindAddrString)
-		if err != nil {
-			log.Panicln("Error resolving address:  ", err)
+	return bytesToSend
+}
+
+// handle the send query in REPL
+func (node *Node) handleSend(dst netip.Addr, data []byte) {
+	// we want to find proper source (interface)
+	// findNext will give us if local or outside
+	// if outside (aka router), send to router with source of interface in neighbortable
+	// else: if local, we kept local.
+	// then use neighborUDP to check validity
+	// if valid, then iterate neighbor list to get interface
+	next_addr, found := node.findNext(dst)
+	if !found {
+		fmt.Println("Error: No match in forwarding table.")
+	} else {
+		// check neighbor
+		_, isNeighbor := node.neighborUDP(next_addr)
+		if isNeighbor {
+			// then send from corersponding interface; find this
+			neighbor := node.neighborTable[next_addr]
+			iface := neighbor.InterfaceName
+			for _, inter := range node.interfaces {
+				if inter.Name == iface {
+					src := inter.AssignedIP
+					p := makePacket(src, dst, 0, 16, data)
+					toSend := &sendInterface{
+						pack:    p,
+						address: next_addr,
+					}
+					node.interfaceSockets[iface] <- toSend
+				}
+			}
+
+		} else {
+			fmt.Println("Error: VIP is not valid dest")
 		}
-
-		// Turn the address string into a UDPAddr for the connection
-		addrString := fmt.Sprintf("%s:%s", address, port)
-		remoteAddr, err := net.ResolveUDPAddr("udp4", addrString)
-		if err != nil {
-			log.Panicln("Error resolving address:  ", err)
-		}
-
-		fmt.Printf("Sending to %s:%d\n",
-			remoteAddr.IP.String(), remoteAddr.Port)
-
-		// Bind on the local UDP port:  this sets the source port
-		// and creates a conn
-		conn, err := net.ListenUDP("udp4", bindLocalAddr)
-		if err != nil {
-			log.Panicln("Dial: ", err)
-		}
-	*/
-	conn, err := net.Dial("udp4", dst.String())
-	if err != nil {
-		fmt.Printf("Error connecting to destination")
-
 	}
-	_, err = conn.Write(bytesToSend) // CHECK THIS IS RIGHT LATER, MIGHT NEED TO WRITE TO BUFFER??
-	if err != nil {
-		fmt.Printf("Error sending to destination")
-	}
-
 	return
 }
 
@@ -227,8 +337,13 @@ func (node *Node) RegisterHandler(protocolNum int, callback HandlerFunc) {
 	node.handlerTable[protocolNum] = callback
 }
 
-func (node *Node) GetNeighborList() []lnxconfig.NeighborConfig {
-	return node.neighbors
+// creates neighbor table
+func (node *Node) createNeighborTable(neighbors []lnxconfig.NeighborConfig) {
+	neighborTable := make(map[netip.Addr]lnxconfig.NeighborConfig)
+	for _, neighbor := range neighbors {
+		neighborTable[neighbor.DestAddr] = neighbor
+	}
+	node.neighborTable = neighborTable
 }
 
 func (node *Node) EnableInterface(name string) error {
@@ -279,20 +394,34 @@ func (node *Node) REPL() {
 		case "lr":
 			// TODO:
 		case "down":
-			err := node.DisableInterface(tokens[1])
-			if err != nil {
-				fmt.Println("Invalid interface")
+			if len(tokens) != 2 {
+				fmt.Println("down usage: down <ifname>")
+			} else {
+				err := node.DisableInterface(tokens[1])
+				if err != nil {
+					fmt.Println("Invalid interface")
+				}
 			}
 		case "up":
-			err := node.EnableInterface(tokens[1])
-			if err != nil {
-				fmt.Println("Invalid interface")
+			if len(tokens) != 2 {
+				fmt.Println("up usage: up <ifname>")
+			} else {
+				err := node.EnableInterface(tokens[1])
+				if err != nil {
+					fmt.Println("Invalid interface")
+				}
 			}
 		case "send":
-			if len(tokens) != 3 {
+			if len(tokens) < 3 {
 				fmt.Println("send usage: send <addr> <message ...>")
 			} else {
-				node.SendIP(netip.MustParseAddr(tokens[1]), 0, []byte(tokens[2])) // TODO: idk
+				parsed_addr := netip.MustParseAddr(tokens[1])
+				_, found := node.findNext(parsed_addr) // where to forward to; our "source"
+				if !found {
+					fmt.Println("Error: No match in forwarding table.")
+				} else {
+					node.handleSend(parsed_addr, []byte(strings.Join(tokens[2:], " ")))
+				}
 			}
 		default:
 
@@ -314,7 +443,7 @@ func (node *Node) printInterfaces() {
 		if node.enabled[iface.Name] {
 			state = "up"
 		}
-		fmt.Printf("%4s  %s %4s\n", iface.Name, iface.AssignedPrefix, state)
+		fmt.Printf("%4s  %s/%d %4s\n", iface.Name, iface.AssignedIP.String(), iface.AssignedPrefix.Bits(), state)
 	}
 }
 
@@ -323,5 +452,4 @@ func (node *Node) printNeighbors() {
 	for _, neighbor := range node.neighbors {
 		fmt.Printf("%4s    %9s  %15s\n", neighbor.InterfaceName, neighbor.DestAddr, neighbor.UDPAddr)
 	}
-	// fmt.Println("neighbors") // TODO: printf formatting alignment stuff
 }
