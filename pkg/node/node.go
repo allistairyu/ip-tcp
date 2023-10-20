@@ -44,6 +44,8 @@ type Node struct {
 	handlerTable     map[int]HandlerFunc
 	ripNeighbors     []netip.Addr
 
+	nodeLock sync.Mutex
+
 	// TODO: is there a less stupid way to do this...
 	enableMtxs  map[string]*sync.Mutex
 	enableConds map[string]*sync.Cond
@@ -72,28 +74,6 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	node.interfaceSockets = make(map[string]chan *sendInterface)
 	node.forwardingTable = make(map[netip.Prefix]*ForwardingInfo)
 
-	// fill interfaces, forwarding table
-	for _, iface := range lnxConfig.Interfaces {
-		node.interfaces[iface.Name] = iface
-		//node.interfaces = append(node.interfaces, iface)
-		info := &ForwardingInfo{
-			route_type: "L",
-			next:       iface.AssignedIP,
-			pre:        iface.AssignedPrefix,
-			cost:       0,
-			ifname:     iface.Name,
-		}
-		//inter_key := fmt.Sprintf("%s/32", iface.AssignedIP)
-		//key, err := netip.ParsePrefix(inter_key)
-		if err != nil {
-			fmt.Println("error making dummy key")
-			continue
-		}
-		node.forwardingTable[info.pre] = info
-		sendChan := make(chan *sendInterface, 1)
-		node.interfaceSockets[iface.Name] = sendChan
-		go node.interfaceRoutine(iface)
-	}
 	node.neighbors = lnxConfig.Neighbors
 	for pre, addr := range lnxConfig.StaticRoutes {
 		info := &ForwardingInfo{
@@ -106,6 +86,22 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	}
 	node.createNeighborTable(lnxConfig.Neighbors)
 
+	for _, iface := range lnxConfig.Interfaces {
+		node.interfaces[iface.Name] = iface
+		info := &ForwardingInfo{
+			route_type: "L",
+			next:       iface.AssignedIP,
+			pre:        iface.AssignedPrefix,
+			cost:       0,
+			ifname:     iface.Name,
+		}
+
+		node.forwardingTable[info.pre] = info
+		sendChan := make(chan *sendInterface, 1)
+		node.interfaceSockets[iface.Name] = sendChan
+		go node.interfaceRoutine(iface)
+	}
+	// send initial rip requests
 	for _, rip_neighbor := range lnxConfig.RipNeighbors {
 		node.ripNeighbors = append(node.ripNeighbors, rip_neighbor)
 		iface := node.neighborTable[rip_neighbor].InterfaceName
@@ -118,24 +114,23 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 			fmt.Printf("Error marshalling request RIP: %s\n", err)
 			continue
 		}
-		for _, inter := range node.interfaces {
-			if inter.Name == iface {
-				packet := makePacket(inter.AssignedIP, rip_neighbor, 200, 16, marshalled)
-				// send this packet
-				toSend := &sendInterface{
-					pack:    packet,
-					address: rip_neighbor,
-				}
-				node.interfaceSockets[iface] <- toSend
-				continue
-			}
+		inter := node.interfaces[iface]
+		packet := makePacket(inter.AssignedIP, rip_neighbor, 200, 16, marshalled)
+		toSend := &sendInterface{
+			pack:    packet,
+			address: rip_neighbor,
 		}
+		node.interfaceSockets[iface] <- toSend
 	}
 	// should add itself
 
-	// figure out what to do with this later
 	node.handlerTable[0] = node.protocol0
 	node.handlerTable[200] = node.protocol200
+
+	go node.periodicUpdates()
+
+	go node.garbageCollector()
+
 	return
 }
 
@@ -155,9 +150,8 @@ func popcount(num uint32) int {
 // impl split horizon
 func (node *Node) sendRIP(dst netip.Addr, subset map[netip.Prefix]*ForwardingInfo) {
 	entries := make([]*rip.RipUpdate, 0)
-	for _, info := range subset {
-		// send cost infinity
-		addy_bytes := info.next.As4()
+	for pre, info := range subset { // send cost infinity
+		addy_bytes := pre.Addr().As4()
 		addy_int := (uint32(addy_bytes[0]) << 24) + (uint32(addy_bytes[1]) << 16) + (uint32(addy_bytes[2]) << 8) + uint32(addy_bytes[3])
 		entry := &rip.RipUpdate{
 			Cost:    uint32(info.cost),
@@ -165,8 +159,7 @@ func (node *Node) sendRIP(dst netip.Addr, subset map[netip.Prefix]*ForwardingInf
 			Mask:    binary.BigEndian.Uint32(net.CIDRMask(info.pre.Bits(), 32)),
 		}
 
-		if dst == info.next && info.cost != -1 && info.route_type == "R" {
-			// split horizon/poison
+		if dst == info.next { // split horizon/poison
 			entry.Cost = uint32(INFTY)
 		}
 		entries = append(entries, entry)
@@ -196,19 +189,17 @@ func (node *Node) sendRIP(dst netip.Addr, subset map[netip.Prefix]*ForwardingInf
 func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 	// handle received rip packets (aka update forwarding table)
 	rip_packet := rip.ExtractRIP(message)
+	//fmt.Printf("command: %d source: %s\n", rip_packet.Command, header.Src.String())
 
-	if rip_packet.Command == 1 {
-		// request, send in response
+	if rip_packet.Command == 1 { // request, send in response
 		defined := make(map[netip.Prefix]*ForwardingInfo)
-
+		node.nodeLock.Lock()
 		for pre, info := range node.forwardingTable {
-			if !(info.route_type == "R" && info.cost == -1) {
-				defined[pre] = info
-			}
+			defined[pre] = info
 		}
+		node.nodeLock.Unlock()
 		node.sendRIP(header.Src, defined)
-	} else {
-		// update table
+	} else { // update table
 		triggered := make(map[netip.Prefix]*ForwardingInfo)
 
 		for _, entry := range rip_packet.Entries {
@@ -222,12 +213,10 @@ func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 				continue
 			}
 			hop := header.Src
-			cost := int(entry.Cost + 1)
-
+			cost := min(int(entry.Cost+1), INFTY)
+			node.nodeLock.Lock()
 			info, ok := node.forwardingTable[pre]
-
-			// not in table / "deleted" (indicated by -1)
-			if !ok || (ok && info.cost == -1) {
+			if !ok && cost != INFTY {
 				val := &ForwardingInfo{
 					route_type:   "R",
 					next:         hop,
@@ -236,8 +225,8 @@ func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 					last_updated: time.Now(),
 				}
 				node.forwardingTable[pre] = val
-			} else {
-				// update using info
+				triggered[pre] = val
+			} else if ok {
 				info.forwardLock.Lock()
 				if info.cost > cost {
 					info.cost = cost
@@ -246,9 +235,12 @@ func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 					triggered[pre] = info
 				} else if info.cost < cost {
 					if hop == info.next {
+						fmt.Printf("%d, %d\n", info.cost, cost)
 						info.cost = cost
 						info.last_updated = time.Now()
 						triggered[pre] = info
+						// delete
+						delete(node.forwardingTable, pre)
 					}
 				} else {
 					if hop == info.next {
@@ -258,9 +250,7 @@ func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 				}
 				info.forwardLock.Unlock()
 			}
-
-			// now do triggered updates: check defined against current info
-
+			node.nodeLock.Unlock()
 		}
 		// send to all route neighbors
 		if len(triggered) > 0 {
@@ -278,7 +268,6 @@ func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 	node.enableConds[iface.Name] = enableCond
 	node.enabled[iface.Name] = true
 
-	// listenString := fmt.Sprintf(":%s", iface.UDPAddr)
 	listenAddr, err := net.ResolveUDPAddr("udp4", iface.UDPAddr.String())
 	if err != nil {
 		log.Panicln("Error resolving address:  ", err)
@@ -287,14 +276,11 @@ func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 	if err != nil {
 		log.Panicln("Could not bind to UDP port: ", err)
 	}
-	// send rip req
 
-	go func() {
-		// handle sends
+	go func() { // handle sends
 		for {
 			select {
 			case received := <-node.interfaceSockets[iface.Name]:
-				// want to send this
 				node.enableMtxs[iface.Name].Lock()
 				if node.enabled[iface.Name] {
 					node.forwardPacket(conn, received.address, received.pack)
@@ -323,52 +309,94 @@ OUTER:
 		}
 		node.enableMtxs[iface.Name].Unlock()
 
-		// https://github.com/brown-csci1680/lecture-examples/blob/main/ip-demo/cmd/udp-ip-recv/main.go#L107
-		header, err := ipv4header.ParseHeader(buffer)
-		if err != nil {
-			fmt.Println("Error parsing header", err)
-			continue
+		go node.handlePackets(buffer, conn)
+	}
+}
+
+func (node *Node) handlePackets(buffer []byte, conn *net.UDPConn) {
+	header, err := ipv4header.ParseHeader(buffer)
+	if err != nil {
+		fmt.Println("Error parsing header", err)
+		return
+	}
+	header.TTL--
+
+	// this should never happen, but just in case
+	if header.TTL < 0 {
+		return
+	}
+
+	headerSize := header.Len
+	headerBytes := buffer[:headerSize]
+	checksumFromHeader := uint16(header.Checksum)
+	computedChecksum := ValidateChecksum(headerBytes, checksumFromHeader)
+	protocolNum := header.Protocol
+	if computedChecksum == checksumFromHeader {
+		header.Checksum = int(computedChecksum)
+
+		if node.checkDest(header.Dst) { // check that we end here
+			node.handlerTable[protocolNum](buffer[headerSize:], header)
+		} else if header.TTL > 0 {
+			next_addr, t, found := node.findNext(header.Dst)
+			if !found {
+				fmt.Println("Error: No match in forwarding table.")
+			} else {
+				if t == "L" { // if the route type we find in forwarding table is local, means that dst is neighbor
+					next_addr = header.Dst
+				}
+				data := makePacket(header.Src, header.Dst, protocolNum, header.TTL, buffer[headerSize:])
+				node.forwardPacket(conn, next_addr, data)
+			}
 		}
-		header.TTL--
+	} else {
+		fmt.Printf("Dropped packet\n")
+	}
+	return
+}
 
-		// this should never happen, but just in case
-		if header.TTL < 0 {
-			continue
+func (node *Node) periodicUpdates() {
+	for {
+		time.Sleep(5000 * time.Millisecond)
+		defined := make(map[netip.Prefix]*ForwardingInfo)
+		node.nodeLock.Lock()
+		for pre, info := range node.forwardingTable {
+			defined[pre] = info
 		}
+		node.nodeLock.Unlock()
+		for _, rip_neighbor := range node.ripNeighbors {
+			node.sendRIP(rip_neighbor, defined)
+		}
+	}
+}
 
-		headerSize := header.Len
-		headerBytes := buffer[:headerSize]
-		checksumFromHeader := uint16(header.Checksum)
-		computedChecksum := ValidateChecksum(headerBytes, checksumFromHeader)
-		protocolNum := header.Protocol
-		if computedChecksum == checksumFromHeader {
-			header.Checksum = int(computedChecksum)
-
-			if node.checkDest(header.Dst) { // check that we end here
-				node.handlerTable[protocolNum](buffer[headerSize:], header)
-			} else if header.TTL > 0 {
-				next_addr, t, found := node.findNext(header.Dst)
-				if !found {
-					fmt.Println("Error: No match in forwarding table.")
-				} else {
-					if t == "L" {
-						next_addr = header.Dst
-					}
-					// is a neighbor directly send
-					data := makePacket(header.Src, header.Dst, protocolNum, header.TTL, buffer[headerSize:])
-					node.forwardPacket(conn, next_addr, data)
-					// send the packet to desired
+func (node *Node) garbageCollector() {
+	for {
+		time.Sleep(7500 * time.Millisecond)
+		triggered := make(map[netip.Prefix]*ForwardingInfo)
+		node.nodeLock.Lock()
+		currTime := time.Now()
+		// iterate through and get rid of all expired
+		for pre, info := range node.forwardingTable {
+			if info.route_type == "R" {
+				if currTime.Sub(info.last_updated).Seconds() >= 12 {
+					// expired
+					info.cost = 16
+					triggered[pre] = info
+					delete(node.forwardingTable, pre)
 				}
 			}
-		} else {
-			fmt.Printf("Dropped packet, message from %s\n", iface.Name)
+		}
+		node.nodeLock.Unlock()
+		if len(triggered) > 0 {
+			for _, rip_neighbor := range node.ripNeighbors {
+				node.sendRIP(rip_neighbor, triggered)
+			}
 		}
 	}
 }
 
 // forward a given packet to nextAddr
 func (node *Node) forwardPacket(conn *net.UDPConn, nextAddr netip.Addr, p Packet) {
-	fmt.Printf("the next forwarding: %s\n", nextAddr.String())
 	udpPort, found := node.neighborUDP(nextAddr)
 	remoteAddr, err := net.ResolveUDPAddr("udp4", udpPort.String())
 	if err != nil {
@@ -377,11 +405,11 @@ func (node *Node) forwardPacket(conn *net.UDPConn, nextAddr netip.Addr, p Packet
 	if !found {
 		fmt.Println("Destination VIP is not a known neighbor")
 	} else {
-		bytesWritten, err := conn.WriteToUDP(p, remoteAddr)
+		_, err := conn.WriteToUDP(p, remoteAddr)
 		if err != nil {
 			fmt.Println("Error writing to socket")
 		}
-		fmt.Printf("Sent %d bytes\n", bytesWritten)
+		//fmt.Printf("Sent %d bytes\n", bytesWritten)
 	}
 }
 
@@ -465,7 +493,6 @@ func makePacket(src netip.Addr, dst netip.Addr, protocolNum int, ttl int, data [
 		Dst:      netip.MustParseAddr(dst.String()),
 		Options:  []byte{},
 	}
-	fmt.Println(hdr.Dst)
 
 	// Assemble the header into a byte array
 	headerBytes, err := hdr.Marshal()
@@ -657,9 +684,7 @@ func (node *Node) printRoutes() {
 		if info.route_type == "L" {
 			fmt.Printf("%s       %9s     LOCAL:%s    %d\n", info.route_type, pre, info.ifname, info.cost)
 		} else if info.route_type == "R" {
-			if info.cost != -1 {
-				fmt.Printf("%s       %9s     %10s    %d\n", info.route_type, pre, info.next, info.cost)
-			}
+			fmt.Printf("%s       %9s     %10s    %d\n", info.route_type, pre, info.next, info.cost)
 		} else {
 			fmt.Printf("%s       %9s     %10s    %d\n", info.route_type, pre, info.next, info.cost)
 		}
