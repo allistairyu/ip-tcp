@@ -35,7 +35,6 @@ type sendInterface struct {
 }
 
 type Node struct {
-	//addr            netip.Addr
 	neighbors        []lnxconfig.NeighborConfig
 	interfaces       map[string]lnxconfig.InterfaceConfig
 	interfaceSockets map[string]chan *sendInterface
@@ -43,13 +42,10 @@ type Node struct {
 	forwardingTable  map[netip.Prefix]*ForwardingInfo
 	handlerTable     map[int]HandlerFunc
 	ripNeighbors     []netip.Addr
-
-	nodeLock sync.Mutex
-
-	// TODO: is there a less stupid way to do this...
-	enableMtxs  map[string]*sync.Mutex
-	enableConds map[string]*sync.Cond
-	enabled     map[string]bool
+	nodeLock         sync.Mutex
+	enableMtxs       map[string]*sync.Mutex
+	enableConds      map[string]*sync.Cond
+	enabled          map[string]bool
 }
 
 type Packet []byte
@@ -235,7 +231,7 @@ func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 					triggered[pre] = info
 				} else if info.cost < cost {
 					if hop == info.next {
-						fmt.Printf("%d, %d\n", info.cost, cost)
+						// fmt.Printf("%d, %d\n", info.cost, cost)
 						info.cost = cost
 						info.last_updated = time.Now()
 						triggered[pre] = info
@@ -279,14 +275,12 @@ func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 
 	go func() { // handle sends
 		for {
-			select {
-			case received := <-node.interfaceSockets[iface.Name]:
-				node.enableMtxs[iface.Name].Lock()
-				if node.enabled[iface.Name] {
-					node.forwardPacket(conn, received.address, received.pack)
-				}
-				node.enableMtxs[iface.Name].Unlock()
+			received := <-node.interfaceSockets[iface.Name]
+			node.enableMtxs[iface.Name].Lock()
+			if node.enabled[iface.Name] {
+				node.forwardPacket(conn, received.address, received.pack)
 			}
+			node.enableMtxs[iface.Name].Unlock()
 		}
 	}()
 
@@ -351,7 +345,6 @@ func (node *Node) handlePackets(buffer []byte, conn *net.UDPConn) {
 	} else {
 		fmt.Printf("Dropped packet\n")
 	}
-	return
 }
 
 func (node *Node) periodicUpdates() {
@@ -545,6 +538,7 @@ func (node *Node) handleSend(dst netip.Addr, data []byte) {
 						pack:    p,
 						address: next_addr,
 					}
+					fmt.Printf("Sent %d bytes\n", 20+len(data))
 					node.interfaceSockets[iface] <- toSend
 				}
 			}
@@ -553,7 +547,6 @@ func (node *Node) handleSend(dst netip.Addr, data []byte) {
 			fmt.Println("Error: VIP is not valid dest")
 		}
 	}
-	return
 }
 
 func (node *Node) RegisterHandler(protocolNum int, callback HandlerFunc) {
@@ -571,7 +564,7 @@ func (node *Node) createNeighborTable(neighbors []lnxconfig.NeighborConfig) {
 
 func (node *Node) EnableInterface(name string) error {
 	if _, ok := node.enabled[name]; !ok {
-		return fmt.Errorf("%s not a valid interface\n", name)
+		return fmt.Errorf("%s not a valid interface", name)
 	}
 	node.enableMtxs[name].Lock()
 	node.enabled[name] = true
@@ -678,15 +671,15 @@ func (node *Node) printNeighbors() {
 }
 
 func (node *Node) printRoutes() {
-	fmt.Println("T       Prefix     Next hop    Cost")
+	fmt.Println("T       Prefix   Next hop   Cost")
 	for _, info := range node.forwardingTable {
 		pre := info.pre
 		if info.route_type == "L" {
-			fmt.Printf("%s       %9s     LOCAL:%s    %d\n", info.route_type, pre, info.ifname, info.cost)
+			fmt.Printf("%s  %11s   LOCAL:%-5s   0\n", info.route_type, pre, info.ifname)
 		} else if info.route_type == "R" {
-			fmt.Printf("%s       %9s     %10s    %d\n", info.route_type, pre, info.next, info.cost)
+			fmt.Printf("%s  %11s   %-11s  %2d\n", info.route_type, pre, info.next, info.cost)
 		} else {
-			fmt.Printf("%s       %9s     %10s    %d\n", info.route_type, pre, info.next, info.cost)
+			fmt.Printf("%s  %11s   %-11s   -\n", info.route_type, pre, info.next)
 		}
 	}
 }
