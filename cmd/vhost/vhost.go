@@ -3,8 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	repl "iptcp/pkg"
 	"iptcp/pkg/lnxconfig"
 	"iptcp/pkg/node"
+	"iptcp/pkg/tcpstack"
 	"log"
 )
 
@@ -26,5 +28,6 @@ func main() {
 	if err != nil {
 
 	}
-	host.REPL()
+	t := tcpstack.Initialize(host)
+	repl.REPL(host, &t)
 }

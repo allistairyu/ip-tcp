@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	repl "iptcp/pkg"
 	"iptcp/pkg/lnxconfig"
 	"iptcp/pkg/node"
 	"log"
@@ -26,5 +27,5 @@ func main() {
 	if err != nil {
 		// figure out when Initialize errors
 	}
-	router.REPL()
+	repl.REPL(router, nil)
 }
