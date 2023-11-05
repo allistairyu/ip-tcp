@@ -41,7 +41,7 @@ type Socket interface {
 type ListenSocket struct {
 	localPort  uint16
 	SID        uint16
-	listenChan chan node.ConnectionInfo
+	listenChan chan node.TCPInfo
 }
 
 type NormalSocket struct {
@@ -50,7 +50,7 @@ type NormalSocket struct {
 	writeBuffer []byte
 	state       uint8
 	node.SocketTableKey
-	normalChan chan node.ConnectionInfo
+	normalChan chan node.TCPInfo
 }
 
 func Initialize(n *node.Node) TCPStack {
@@ -82,7 +82,7 @@ func (t *TCPStack) VListen(port uint16) (*ListenSocket, error) {
 		// already listening on port
 		return nil, fmt.Errorf("already listening on port %d", port)
 	}
-	lsock := &ListenSocket{localPort: port, listenChan: make(chan node.ConnectionInfo), SID: t.SID}
+	lsock := &ListenSocket{localPort: port, listenChan: make(chan node.TCPInfo), SID: t.SID} // TODO: chan blocking?
 	t.SID++
 	t.socketTable[*SocketTableKey] = lsock
 	return lsock, nil
@@ -105,7 +105,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		writeBuffer:    make([]byte, 0),
 		state:          SYN_SENT,
 		SocketTableKey: *sk,
-		normalChan:     make(chan node.ConnectionInfo),
+		normalChan:     make(chan node.TCPInfo), // TODO: chan blocking?
 	}
 	t.SID++
 	t.socketTable[*sk] = newSocket
@@ -113,7 +113,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	seqNum := rand.Uint32()
 	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, seqNum, 0) //TODO: ack num?
 	i := 0
-	var ci node.ConnectionInfo
+	var ci node.TCPInfo
 	var timeout chan bool
 	for {
 		n.HandleSend(destAddr, tcpPacket, 6)
@@ -149,7 +149,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 
 func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, error) {
 	// wait for SYN
-	var ci node.ConnectionInfo
+	var ci node.TCPInfo
 	for !(ci.Flag == header.TCPFlagSyn && ci.SocketTableKey.ServerPort == lsock.localPort) {
 		ci = <-lsock.listenChan
 	}
@@ -162,7 +162,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		writeBuffer:    make([]byte, 0),
 		state:          SYN_RECEIVED,
 		SocketTableKey: sk,
-		normalChan:     make(chan node.ConnectionInfo),
+		normalChan:     make(chan node.TCPInfo), // TODO: chan blocking?
 	}
 	t.SID++
 	t.socketTable[sk] = newSocket

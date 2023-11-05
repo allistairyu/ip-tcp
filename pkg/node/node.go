@@ -32,20 +32,24 @@ type sendInterface struct {
 	address netip.Addr
 }
 
+type Interface struct {
+	lnxconfig.InterfaceConfig
+	sendInterfaceChan chan *sendInterface
+	enableMutex       *sync.Mutex
+	enableCond        *sync.Cond
+	enabled           bool
+}
+
 type Node struct {
-	neighbors        []lnxconfig.NeighborConfig
-	interfaces       map[string]lnxconfig.InterfaceConfig
-	interfaceSockets map[string]chan *sendInterface
-	neighborTable    map[netip.Addr]lnxconfig.NeighborConfig
-	forwardingTable  map[netip.Prefix]*ForwardingInfo
-	handlerTable     map[int]HandlerFunc
-	ripNeighbors     []netip.Addr
-	nodeLock         sync.Mutex
-	enableMtxs       map[string]*sync.Mutex
-	enableConds      map[string]*sync.Cond
-	enabled          map[string]bool
-	TCPChan          chan ConnectionInfo
-	IpAddr           netip.Addr
+	neighbors       []lnxconfig.NeighborConfig
+	interfaces      map[string]Interface
+	neighborTable   map[netip.Addr]lnxconfig.NeighborConfig
+	forwardingTable map[netip.Prefix]*ForwardingInfo
+	handlerTable    map[int]HandlerFunc
+	ripNeighbors    []netip.Addr
+	nodeLock        sync.Mutex
+	TCPChan         chan TCPInfo
+	IpAddr          netip.Addr
 }
 
 type SocketTableKey struct {
@@ -56,7 +60,7 @@ type SocketTableKey struct {
 }
 
 // TODO: rename lol
-type ConnectionInfo struct {
+type TCPInfo struct {
 	SocketTableKey
 	Flag   uint8
 	SeqNum uint32
@@ -78,13 +82,9 @@ const (
 func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	node = new(Node)
 	node.handlerTable = make(map[int]HandlerFunc)
-	node.enableMtxs = make(map[string]*sync.Mutex)
-	node.enableConds = make(map[string]*sync.Cond)
-	node.enabled = make(map[string]bool)
-	node.interfaces = make(map[string]lnxconfig.InterfaceConfig)
-	node.interfaceSockets = make(map[string]chan *sendInterface)
+	node.interfaces = make(map[string]Interface)
 	node.forwardingTable = make(map[netip.Prefix]*ForwardingInfo)
-	node.TCPChan = make(chan ConnectionInfo)
+	node.TCPChan = make(chan TCPInfo)
 
 	node.neighbors = lnxConfig.Neighbors
 	for pre, addr := range lnxConfig.StaticRoutes {
@@ -98,7 +98,12 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	}
 	node.createNeighborTable(lnxConfig.Neighbors)
 
-	for _, iface := range lnxConfig.Interfaces {
+	for _, ifaceConfig := range lnxConfig.Interfaces {
+		iface := Interface{
+			InterfaceConfig:   ifaceConfig,
+			sendInterfaceChan: make(chan *sendInterface, 1),
+			enabled:           true,
+		}
 		node.interfaces[iface.Name] = iface
 		info := &ForwardingInfo{
 			route_type: "L",
@@ -109,8 +114,6 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 		}
 
 		node.forwardingTable[info.pre] = info
-		sendChan := make(chan *sendInterface, 1)
-		node.interfaceSockets[iface.Name] = sendChan
 		go node.interfaceRoutine(iface)
 	}
 	// send initial rip requests
@@ -132,7 +135,7 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 			pack:    packet,
 			address: rip_neighbor,
 		}
-		node.interfaceSockets[iface] <- toSend
+		node.interfaces[iface].sendInterfaceChan <- toSend
 	}
 	// should add itself
 	node.IpAddr = node.interfaces["if0"].AssignedIP
@@ -176,7 +179,7 @@ func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
 		ServerAddr: node.IpAddr,
 		ServerPort: tcpHdr.DstPort,
 	}
-	node.TCPChan <- ConnectionInfo{SocketTableKey: sk,
+	node.TCPChan <- TCPInfo{SocketTableKey: sk,
 		Flag:   tcpHdr.Flags,
 		SeqNum: 0,
 		AckNum: 0,
@@ -227,14 +230,13 @@ func (node *Node) sendRIP(dst netip.Addr, subset map[netip.Prefix]*ForwardingInf
 		pack:    packet,
 		address: dst,
 	}
-	node.interfaceSockets[inter] <- toSend
-
+	// node.interfaceSockets[inter] <- toSend
+	node.interfaces[inter].sendInterfaceChan <- toSend
 }
 
 func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 	// handle received rip packets (aka update forwarding table)
 	rip_packet := rip.ExtractRIP(message)
-	//fmt.Printf("command: %d source: %s\n", rip_packet.Command, header.Src.String())
 
 	if rip_packet.Command == 1 { // request, send in response
 		defined := make(map[netip.Prefix]*ForwardingInfo)
@@ -280,7 +282,6 @@ func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 					triggered[pre] = info
 				} else if info.cost < cost {
 					if hop == info.next {
-						// fmt.Printf("%d, %d\n", info.cost, cost)
 						info.cost = cost
 						info.last_updated = time.Now()
 						triggered[pre] = info
@@ -306,12 +307,9 @@ func (node *Node) protocol200(message Packet, header *ipv4header.IPv4Header) {
 	}
 }
 
-func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
-	enableMutex := sync.Mutex{}
-	enableCond := sync.NewCond(&enableMutex)
-	node.enableMtxs[iface.Name] = &enableMutex
-	node.enableConds[iface.Name] = enableCond
-	node.enabled[iface.Name] = true
+func (node *Node) interfaceRoutine(iface Interface) {
+	iface.enableMutex = &sync.Mutex{}
+	iface.enableCond = sync.NewCond(iface.enableMutex)
 
 	listenAddr, err := net.ResolveUDPAddr("udp4", iface.UDPAddr.String())
 	if err != nil {
@@ -324,12 +322,12 @@ func (node *Node) interfaceRoutine(iface lnxconfig.InterfaceConfig) {
 
 	go func() { // handle sends
 		for {
-			received := <-node.interfaceSockets[iface.Name]
-			node.enableMtxs[iface.Name].Lock()
-			if node.enabled[iface.Name] {
+			received := <-node.interfaces[iface.Name].sendInterfaceChan
+			iface.enableMutex.Lock()
+			if iface.enabled {
 				node.forwardPacket(conn, received.address, received.pack)
 			}
-			node.enableMtxs[iface.Name].Unlock()
+			iface.enableMutex.Unlock()
 		}
 	}()
 
@@ -342,15 +340,15 @@ OUTER:
 		}
 
 		// Check if interface is disabled
-		node.enableMtxs[iface.Name].Lock()
-		for !node.enabled[iface.Name] {
-			node.enableConds[iface.Name].Wait()
-			if node.enabled[iface.Name] {
-				node.enableMtxs[iface.Name].Unlock()
-				continue OUTER // https://relistan.com/continue-statement-with-labels-in-go
+		iface.enableMutex.Lock()
+		for !iface.enabled {
+			iface.enableCond.Wait()
+			if iface.enabled {
+				iface.enableMutex.Unlock()
+				continue OUTER
 			}
 		}
-		node.enableMtxs[iface.Name].Unlock()
+		iface.enableMutex.Unlock()
 
 		go node.handlePackets(buffer, conn)
 	}
@@ -468,7 +466,7 @@ func (node *Node) neighborUDP(dst netip.Addr) (netip.AddrPort, bool) {
 
 // check if destination corresponds to current node
 func (node *Node) checkDest(dst netip.Addr) bool {
-	var toUse lnxconfig.InterfaceConfig
+	var toUse Interface
 	len := -1
 	for _, iface := range node.interfaces {
 		prefix := iface.AssignedPrefix
@@ -588,7 +586,8 @@ func (node *Node) HandleSend(dst netip.Addr, data []byte, protocolNum int) {
 						address: next_addr,
 					}
 					// fmt.Printf("Sent %d bytes\n", 20+len(data))
-					node.interfaceSockets[iface] <- toSend
+					// node.interfaceSockets[iface] <- toSend
+					node.interfaces[iface].sendInterfaceChan <- toSend
 				}
 			}
 
@@ -611,25 +610,15 @@ func (node *Node) createNeighborTable(neighbors []lnxconfig.NeighborConfig) {
 	node.neighborTable = neighborTable
 }
 
-func (node *Node) EnableInterface(name string) error {
-	if _, ok := node.enabled[name]; !ok {
+func (node *Node) ToggleInterface(name string, b bool) error {
+	if iface, ok := node.interfaces[name]; !ok {
 		return fmt.Errorf("%s not a valid interface", name)
+	} else {
+		iface.enableMutex.Lock()
+		iface.enabled = b
+		iface.enableCond.Broadcast()
+		iface.enableMutex.Unlock()
 	}
-	node.enableMtxs[name].Lock()
-	node.enabled[name] = true
-	node.enableConds[name].Broadcast()
-	node.enableMtxs[name].Unlock()
-	return nil
-}
-
-func (node *Node) DisableInterface(name string) error {
-	if _, ok := node.enabled[name]; !ok {
-		return fmt.Errorf("%s not a valid interface", name)
-	}
-	node.enableMtxs[name].Lock()
-	node.enabled[name] = false
-	node.enableConds[name].Broadcast()
-	node.enableMtxs[name].Unlock()
 	return nil
 }
 
@@ -648,7 +637,7 @@ func (node *Node) PrintInterfaces() {
 	fmt.Println("Name  Addr/Prefix State")
 	for _, iface := range node.interfaces {
 		state := "down"
-		if node.enabled[iface.Name] {
+		if iface.enabled {
 			state = "up"
 		}
 		fmt.Printf("%4s  %s/%d %4s\n", iface.Name, iface.AssignedIP.String(), iface.AssignedPrefix.Bits(), state)
@@ -667,11 +656,11 @@ func (node *Node) PrintRoutes() {
 	for _, info := range node.forwardingTable {
 		pre := info.pre
 		if info.route_type == "L" {
-			fmt.Printf("%s  %11s   LOCAL:%-5s   0\n", info.route_type, pre, info.ifname)
+			fmt.Printf("%s  %-11s  LOCAL:%-5s    0\n", info.route_type, pre, info.ifname)
 		} else if info.route_type == "R" {
-			fmt.Printf("%s  %11s   %-11s  %2d\n", info.route_type, pre, info.next, info.cost)
+			fmt.Printf("%s  %11s %10s     %2d\n", info.route_type, pre, info.next, info.cost)
 		} else {
-			fmt.Printf("%s  %11s   %-11s   -\n", info.route_type, pre, info.next)
+			fmt.Printf("%s  %11s %10s      -\n", info.route_type, pre, info.next)
 		}
 	}
 }

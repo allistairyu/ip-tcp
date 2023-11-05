@@ -43,7 +43,7 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 			if len(tokens) != 2 {
 				fmt.Println("down usage: down <ifname>")
 			} else {
-				err := node.DisableInterface(tokens[1])
+				err := node.ToggleInterface(tokens[1], false)
 				if err != nil {
 					fmt.Println("Invalid interface")
 				}
@@ -52,7 +52,7 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 			if len(tokens) != 2 {
 				fmt.Println("up usage: up <ifname>")
 			} else {
-				err := node.EnableInterface(tokens[1])
+				err := node.ToggleInterface(tokens[1], true)
 				if err != nil {
 					fmt.Println("Invalid interface")
 				}
