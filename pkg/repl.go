@@ -97,6 +97,16 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 			}
 		case "ls":
 			t.PrintTable()
+		case "s":
+			fmt.Println("to do")
+		case "r":
+			fmt.Println("to do")
+		case "cl":
+			fmt.Println("to do")
+		case "sf":
+			fmt.Println("to do")
+		case "rf":
+			fmt.Println("to do")
 		default:
 
 		}

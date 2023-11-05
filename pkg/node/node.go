@@ -44,16 +44,23 @@ type Node struct {
 	enableMtxs       map[string]*sync.Mutex
 	enableConds      map[string]*sync.Cond
 	enabled          map[string]bool
-	TCPChan          chan HandshakeInfo
+	TCPChan          chan ConnectionInfo
 	IpAddr           netip.Addr
 }
 
-type HandshakeInfo struct {
+type SocketTableKey struct {
 	ClientAddr netip.Addr
 	ClientPort uint16
 	ServerAddr netip.Addr
 	ServerPort uint16
-	Flag       uint8
+}
+
+// TODO: rename lol
+type ConnectionInfo struct {
+	SocketTableKey
+	Flag   uint8
+	SeqNum uint32
+	AckNum uint32
 }
 
 type Packet []byte
@@ -77,7 +84,7 @@ func Initialize(lnxConfig *lnxconfig.IPConfig) (node *Node, err error) {
 	node.interfaces = make(map[string]lnxconfig.InterfaceConfig)
 	node.interfaceSockets = make(map[string]chan *sendInterface)
 	node.forwardingTable = make(map[netip.Prefix]*ForwardingInfo)
-	node.TCPChan = make(chan HandshakeInfo)
+	node.TCPChan = make(chan ConnectionInfo)
 
 	node.neighbors = lnxConfig.Neighbors
 	for pre, addr := range lnxConfig.StaticRoutes {
@@ -162,8 +169,18 @@ func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
 	// }
 	// Finally, print everything out
 	// fmt.Printf("Received TCP packet from %s\nIP Header:  %v\nIP Checksum:  %s\nTCP header:  %+v\nFlags:  %s\nTCP Checksum:  %s\nPayload (%d bytes):  %s\n",
-	// "0.0.0.0", hdr, "OK", tcpHdr, iptcp_utils.TCPFlagsAsString(tcpHdr.Flags), tcpChecksumState, len(tcpPayload), string(tcpPayload))
-	node.TCPChan <- HandshakeInfo{ClientAddr: hdr.Src, ClientPort: tcpHdr.SrcPort, ServerAddr: node.IpAddr, ServerPort: tcpHdr.DstPort, Flag: tcpHdr.Flags}
+	// "0.0.0.0", hdr, "OK", tcpHdr, iptcp_utils.TCPFlagsAsString(tcpHdr.Flags),
+	// tcpChecksumState, len(tcpPayload), string(tcpPayload))
+	sk := SocketTableKey{ClientAddr: hdr.Src,
+		ClientPort: tcpHdr.SrcPort,
+		ServerAddr: node.IpAddr,
+		ServerPort: tcpHdr.DstPort,
+	}
+	node.TCPChan <- ConnectionInfo{SocketTableKey: sk,
+		Flag:   tcpHdr.Flags,
+		SeqNum: 0,
+		AckNum: 0,
+	}
 }
 
 func popcount(num uint32) int {
