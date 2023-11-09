@@ -62,10 +62,11 @@ type SocketTableKey struct {
 // TODO: rename lol
 type TCPInfo struct {
 	SocketTableKey
-	Flag    uint8
-	SeqNum  uint32
-	AckNum  uint32
-	Payload Packet
+	Flag       uint8
+	SeqNum     uint32
+	AckNum     uint32
+	WindowSize uint16
+	Payload    Packet
 }
 
 type Packet []byte
@@ -181,10 +182,11 @@ func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
 		ServerPort: tcpHdr.DstPort,
 	}
 	node.TCPChan <- TCPInfo{SocketTableKey: sk,
-		Flag:    tcpHdr.Flags,
-		SeqNum:  tcpHdr.SeqNum,
-		AckNum:  tcpHdr.AckNum,
-		Payload: message[20:],
+		Flag:       tcpHdr.Flags,
+		SeqNum:     tcpHdr.SeqNum,
+		AckNum:     tcpHdr.AckNum,
+		Payload:    message[20:],
+		WindowSize: tcpHdr.WindowSize,
 	}
 }
 

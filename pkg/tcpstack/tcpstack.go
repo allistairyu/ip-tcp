@@ -101,7 +101,6 @@ func (t *TCPStack) VListen(port uint16) (*ListenSocket, error) {
 		return nil, fmt.Errorf("already listening on port %d", port)
 	}
 	lsock := &ListenSocket{localPort: port, listenChan: make(chan node.TCPInfo), SID: t.SID} // TODO: chan blocking?
-	t.SID_to_sk[t.SID] = *SocketTableKey
 	t.SID++
 	t.SocketTable[*SocketTableKey] = lsock
 	return lsock, nil
@@ -265,19 +264,39 @@ func makeTCPPacket(sourceIp netip.Addr, destIp netip.Addr,
 	return ipPacketPayload
 }
 
-// func (socket *NormalSocket) socketHandler() {
-// 	var received node.TCPInfo
-// 	for {
-// 		received <- socket.normalChan
-// 		if received.Flag == header.TCPFlagAck {
-// 			// update write buffer pointers
+// FOR SENDER + RECEIVER: later if we need to deal with clean shutdowns, im guessing channels would work here (or some sort of var)
 
-// 			// update read buffer pointers
-// 			// write the payload to the read buffer
+func (socket *NormalSocket) SenderThread() {
+	// i think the whole channel thing is prolly applicable here; wake up when new stuff written?
+	// actually not too sure
+	// ok ok it should be like
+	/*
+		for {
+			if (ack is not caught up) {
+				// logic
+			}
+			else {
+				all caught up now, just need to wait for new stuff to be written
 
-// 		}
-// 	}
-// }
+				use channel to wake up this thread
+			}
+		}
+	*/
+	panic("todo")
+}
+
+func (socket *NormalSocket) ReceiverThread() {
+	// this should be more straight forward??
+	// p sure its just direct impl
+	var received node.TCPInfo
+	for {
+		received = <-socket.normalChan
+		if received.Flag == header.TCPFlagAck {
+			// update read buffer pointers
+			// write the payload to the read buffer
+		}
+	}
+}
 
 func (socket *NormalSocket) VWrite() error {
 	panic("todo")

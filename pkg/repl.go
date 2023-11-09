@@ -17,11 +17,12 @@ func listenAndAccept(port uint16, t *tcpstack.TCPStack, n *node.Node) error {
 		return err
 	}
 	for {
-		_, err := lsocket.VAccept(t, n)
+		normalSock, err := lsocket.VAccept(t, n)
 		if err != nil {
 			return err
 		}
-
+		go normalSock.ReceiverThread()
+		go normalSock.SenderThread()
 	}
 }
 
@@ -93,7 +94,12 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 					fmt.Println("Could not parse address")
 					continue
 				}
-				t.VConnect(addr, uint16(port), node)
+				norm, err := t.VConnect(addr, uint16(port), node)
+				if err != nil {
+					fmt.Printf("Error: %s\n", err)
+				}
+				go norm.SenderThread()
+				go norm.ReceiverThread()
 			}
 		case "ls":
 			t.PrintTable()
@@ -118,9 +124,7 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 			if !ok {
 				fmt.Println("Could not find socket")
 			}
-			// if sk.ClientAddr == nil {
-			// 	fmt.Println("Socket ID corresponds to listening socket")
-			// }
+
 			socket, ok := t.SocketTable[sk]
 			if !ok {
 				fmt.Println("Could not find socket")
