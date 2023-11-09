@@ -285,8 +285,19 @@ func (socket *NormalSocket) VWrite() error {
 
 func (socket *NormalSocket) VRead(numbytes uint16) error {
 	num_buf := (socket.readBuffer.NXT - socket.readBuffer.LBR + WINDOW_SIZE) % WINDOW_SIZE
-	num_read = min(uint16(num_buf), numbytes)
+	num_read := min(num_buf, uint32(numbytes))
+
 	// read up to this
+	first_seg := min(socket.readBuffer.LBR+uint32(num_read), WINDOW_SIZE-1)
+	second_seg := num_read - (first_seg - socket.readBuffer.LBR) // in case it wraps around
+
+	// append the two parts (hopefully slice[0:0] is just empty)
+	toRead := append(socket.readBuffer.buffer[socket.readBuffer.LBR:socket.readBuffer.LBR+first_seg], socket.readBuffer.buffer[0:second_seg]...)
+
+	fmt.Printf("Read %d bytes: %s\n", num_read, string(toRead))
+
+	// adjust LBR
+	socket.readBuffer.LBR = (socket.readBuffer.LBR + uint32(num_read)) % WINDOW_SIZE
 	return nil
 }
 
