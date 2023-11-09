@@ -181,8 +181,8 @@ func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
 	}
 	node.TCPChan <- TCPInfo{SocketTableKey: sk,
 		Flag:   tcpHdr.Flags,
-		SeqNum: 0,
-		AckNum: 0,
+		SeqNum: tcpHdr.SeqNum,
+		AckNum: tcpHdr.AckNum,
 	}
 }
 
