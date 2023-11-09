@@ -110,14 +110,13 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	t.SID++
 	t.socketTable[*sk] = newSocket
 
-	seqNum := rand.Uint32()
-	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, seqNum, 0) //TODO: ack num?
+	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, rand.Uint32(), 0)
 	i := 0
 	var ci node.TCPInfo
 	var timeout chan bool
 	for {
 		n.HandleSend(destAddr, tcpPacket, 6)
-		go func(timeout chan bool) {
+		go func(timeout chan bool) { // TODO: test timeout stuff
 			time.Sleep(3 * time.Second)
 			timeout <- true
 		}(timeout)
@@ -168,8 +167,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 	t.socketTable[sk] = newSocket
 
 	// send SYN+ACK back to client
-	seqNum := rand.Uint32() // TODO: random?
-	tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, nil, SYNACK, sk.ServerPort, sk.ClientPort, seqNum, ci.SeqNum+1)
+	tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, nil, SYNACK, sk.ServerPort, sk.ClientPort, rand.Uint32(), ci.SeqNum+1)
 
 	n.HandleSend(sk.ClientAddr, tcpPacket, 6)
 
