@@ -62,9 +62,10 @@ type SocketTableKey struct {
 // TODO: rename lol
 type TCPInfo struct {
 	SocketTableKey
-	Flag   uint8
-	SeqNum uint32
-	AckNum uint32
+	Flag    uint8
+	SeqNum  uint32
+	AckNum  uint32
+	Payload Packet
 }
 
 type Packet []byte
@@ -157,7 +158,7 @@ func (node *Node) protocol0(message Packet, header *ipv4header.IPv4Header) {
 
 // TCP protocol
 func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
-	tcpHeaderAndData := message[:hdr.TotalLen]
+	tcpHeaderAndData := message
 	tcpHdr := iptcp_utils.ParseTCPHeader(tcpHeaderAndData)
 	// tcpPayload := tcpHeaderAndData[tcpHdr.DataOffset:]
 	// tcpChecksumFromHeader := tcpHdr.Checksum // Save original
@@ -180,9 +181,10 @@ func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
 		ServerPort: tcpHdr.DstPort,
 	}
 	node.TCPChan <- TCPInfo{SocketTableKey: sk,
-		Flag:   tcpHdr.Flags,
-		SeqNum: tcpHdr.SeqNum,
-		AckNum: tcpHdr.AckNum,
+		Flag:    tcpHdr.Flags,
+		SeqNum:  tcpHdr.SeqNum,
+		AckNum:  tcpHdr.AckNum,
+		Payload: message[20:],
 	}
 }
 
@@ -334,7 +336,7 @@ func (node *Node) interfaceRoutine(iface Interface) {
 OUTER:
 	for {
 		buffer := make([]byte, MaxMessageSize) // max IP packet size of 1400 bytes
-		_, _, err := conn.ReadFromUDP(buffer)
+		n, _, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Panicln("Error reading from UDP socket ", err)
 		}
@@ -350,7 +352,7 @@ OUTER:
 		}
 		iface.enableMutex.Unlock()
 
-		go node.handlePackets(buffer, conn)
+		go node.handlePackets(buffer[:n], conn)
 	}
 }
 

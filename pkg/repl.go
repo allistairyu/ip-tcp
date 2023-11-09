@@ -100,7 +100,33 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 		case "s":
 			fmt.Println("to do")
 		case "r":
-			fmt.Println("to do")
+			if len(tokens) != 3 {
+				fmt.Println("r usage: r <socket ID> <numbytes>")
+			}
+			sock, err := strconv.ParseUint(tokens[1], 10, 16)
+			if err != nil {
+				fmt.Println("Could not parse socket ID as int")
+				continue
+			}
+			num, err := strconv.ParseUint(tokens[2], 10, 16)
+			if err != nil {
+				fmt.Println("Could not parse numbytes as int")
+				continue
+			}
+			// check socket ID is valid
+			sk, ok := t.SID_to_sk[sock]
+			if !ok {
+				fmt.Println("Could not find socket")
+			}
+			if sk.ClientAddr == nil {
+				fmt.Println("Socket ID corresponds to listening socket")
+			}
+			socket, ok := t.socketTable[sk]
+			if !ok {
+				fmt.Println("Could not find socket")
+			}
+			socket.VRead(num)
+
 		case "cl":
 			fmt.Println("to do")
 		case "sf":

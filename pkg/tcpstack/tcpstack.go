@@ -19,6 +19,7 @@ const (
 	ESTABLISHED
 	SYNACK = uint8(header.TCPFlagSyn | header.TCPFlagAck)
 )
+const WINDOW_SIZE = 65536
 
 var stateMap = map[uint8]string{
 	LISTEN:       "LISTEN",
@@ -30,7 +31,22 @@ var stateMap = map[uint8]string{
 type TCPStack struct {
 	socketTable map[node.SocketTableKey]Socket
 	ip          netip.Addr
+	SID_to_sk   map[uint16]node.SocketTableKey
 	SID         uint16
+}
+
+type ReadBuffer struct {
+	buffer []byte
+	LBR    uint32
+	NXT    uint32
+	// add some sort of queue for out of order
+}
+
+type WriteBuffer struct {
+	buffer []byte
+	UNA    uint32
+	NXT    uint32
+	LBW    uint32
 }
 
 type Socket interface {
@@ -46,15 +62,17 @@ type ListenSocket struct {
 
 type NormalSocket struct {
 	SID         uint16
-	readBuffer  []byte
-	writeBuffer []byte
+	readBuffer  *ReadBuffer
+	writeBuffer *WriteBuffer
 	state       uint8
 	node.SocketTableKey
 	normalChan chan node.TCPInfo
+	baseSeq    uint32
+	baseAck    uint32
 }
 
 func Initialize(n *node.Node) TCPStack {
-	tcpStack := &TCPStack{ip: n.IpAddr, socketTable: make(map[node.SocketTableKey]Socket), SID: 0}
+	tcpStack := &TCPStack{ip: n.IpAddr, socketTable: make(map[node.SocketTableKey]Socket), SID_to_sk: make(map[uint16]node.SocketTableKey), SID: 0}
 
 	// handle matching process
 	go func() {
@@ -83,12 +101,13 @@ func (t *TCPStack) VListen(port uint16) (*ListenSocket, error) {
 		return nil, fmt.Errorf("already listening on port %d", port)
 	}
 	lsock := &ListenSocket{localPort: port, listenChan: make(chan node.TCPInfo), SID: t.SID} // TODO: chan blocking?
+	t.SID_to_sk[t.SID] = *SocketTableKey
 	t.SID++
 	t.socketTable[*SocketTableKey] = lsock
 	return lsock, nil
 }
 
-func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) (NormalSocket, error) {
+func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) (*NormalSocket, error) {
 	// generate new random port
 	var randSrcPort uint16
 	for {
@@ -101,12 +120,11 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	sk := &node.SocketTableKey{ClientAddr: t.ip, ClientPort: randSrcPort, ServerAddr: destAddr, ServerPort: destPort}
 	newSocket := &NormalSocket{
 		SID:            t.SID,
-		readBuffer:     make([]byte, 0),
-		writeBuffer:    make([]byte, 0),
 		state:          SYN_SENT,
 		SocketTableKey: *sk,
 		normalChan:     make(chan node.TCPInfo), // TODO: chan blocking?
 	}
+	t.SID_to_sk[t.SID] = *sk
 	t.SID++
 	t.socketTable[*sk] = newSocket
 
@@ -114,18 +132,23 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	i := 0
 	var ci node.TCPInfo
 	var timeout chan bool
+	// TO FIX: it never processes that true is passed into timeout, gets stuck at select block
 	for {
+		fmt.Println("hello")
 		n.HandleSend(destAddr, tcpPacket, 6)
-		go func(timeout chan bool) { // TODO: test timeout stuff
+		go func(tmt chan bool) { // TODO: test timeout stuff
 			time.Sleep(3 * time.Second)
-			timeout <- true
+			fmt.Println("slept")
+			tmt <- true
+			return
 		}(timeout)
 		select {
 		case ci = <-newSocket.normalChan: // wait until protocol6 confirms
 		case <-timeout:
 			i++
+			fmt.Printf("try num: %d\n", i)
 			if i == 3 {
-				return NormalSocket{}, errors.New("could not connect")
+				return &NormalSocket{}, errors.New("could not connect")
 			}
 			continue
 		}
@@ -134,16 +157,31 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		}
 		i++
 		if i == 3 {
-			return NormalSocket{}, errors.New("could not connect")
+			return &NormalSocket{}, errors.New("could not connect")
 		}
 	}
+	new_read := &ReadBuffer{
+		buffer: make([]byte, WINDOW_SIZE),
+		LBR:    0,
+		NXT:    1,
+	}
+	new_send := &WriteBuffer{
+		buffer: make([]byte, WINDOW_SIZE),
+		UNA:    1,
+		NXT:    1,
+		LBW:    0,
+	}
+	newSocket.readBuffer = new_read
+	newSocket.writeBuffer = new_send
+	newSocket.baseAck = ci.SeqNum
+	newSocket.baseSeq = ci.AckNum - 1
 
 	t.socketTable[*sk].(*NormalSocket).state = ESTABLISHED
 	tcpPacket = makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagAck, randSrcPort, destPort, ci.AckNum, ci.SeqNum+1)
 	// establish connection
 	n.HandleSend(destAddr, tcpPacket, 6)
 
-	return *newSocket, nil
+	return newSocket, nil
 }
 
 func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, error) {
@@ -154,20 +192,35 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 	}
 	sk := ci.SocketTableKey
 
+	new_read := &ReadBuffer{
+		buffer: make([]byte, WINDOW_SIZE),
+		LBR:    0,
+		NXT:    1,
+	}
+	new_send := &WriteBuffer{
+		buffer: make([]byte, WINDOW_SIZE),
+		UNA:    1,
+		NXT:    1,
+		LBW:    0,
+	}
 	// create new normal socket
 	newSocket := &NormalSocket{
 		SID:            t.SID,
-		readBuffer:     make([]byte, 0),
-		writeBuffer:    make([]byte, 0),
+		readBuffer:     new_read,
+		writeBuffer:    new_send,
 		state:          SYN_RECEIVED,
 		SocketTableKey: sk,
 		normalChan:     make(chan node.TCPInfo), // TODO: chan blocking?
 	}
+	t.SID_to_sk[t.SID] = sk
 	t.SID++
 	t.socketTable[sk] = newSocket
 
+	newSocket.baseAck = ci.SeqNum
+	newSocket.baseSeq = rand.Uint32()
+
 	// send SYN+ACK back to client
-	tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, nil, SYNACK, sk.ServerPort, sk.ClientPort, rand.Uint32(), ci.SeqNum+1)
+	tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, nil, SYNACK, sk.ServerPort, sk.ClientPort, newSocket.baseSeq, ci.SeqNum+1)
 
 	n.HandleSend(sk.ClientAddr, tcpPacket, 6)
 
@@ -212,12 +265,29 @@ func makeTCPPacket(sourceIp netip.Addr, destIp netip.Addr,
 	return ipPacketPayload
 }
 
+// func (socket *NormalSocket) socketHandler() {
+// 	var received node.TCPInfo
+// 	for {
+// 		received <- socket.normalChan
+// 		if received.Flag == header.TCPFlagAck {
+// 			// update write buffer pointers
+
+// 			// update read buffer pointers
+// 			// write the payload to the read buffer
+
+// 		}
+// 	}
+// }
+
 func (socket *NormalSocket) VWrite() error {
 	panic("todo")
 }
 
-func (socket *NormalSocket) VRead() error {
-	panic("todo")
+func (socket *NormalSocket) VRead(numbytes uint16) error {
+	num_buf := (socket.readBuffer.NXT - socket.readBuffer.LBR + WINDOW_SIZE) % WINDOW_SIZE
+	num_read = min(uint16(num_buf), numbytes)
+	// read up to this
+	return nil
 }
 
 func (socket *NormalSocket) VClose() error {
@@ -234,7 +304,7 @@ func (socket *NormalSocket) printSocket() {
 }
 
 func (socket *ListenSocket) printSocket() {
-	fmt.Printf("  0    0.0.0.0 %5d    0.0.0.0     0       LISTEN\n", socket.localPort)
+	fmt.Printf("  %d    0.0.0.0 %5d    0.0.0.0     0       LISTEN\n", socket.SID, socket.localPort)
 }
 
 func (t *TCPStack) PrintTable() {
