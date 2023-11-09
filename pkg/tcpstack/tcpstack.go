@@ -29,7 +29,7 @@ var stateMap = map[uint8]string{
 }
 
 type TCPStack struct {
-	socketTable map[node.SocketTableKey]Socket
+	SocketTable map[node.SocketTableKey]Socket
 	ip          netip.Addr
 	SID_to_sk   map[uint16]node.SocketTableKey
 	SID         uint16
@@ -72,7 +72,7 @@ type NormalSocket struct {
 }
 
 func Initialize(n *node.Node) TCPStack {
-	tcpStack := &TCPStack{ip: n.IpAddr, socketTable: make(map[node.SocketTableKey]Socket), SID_to_sk: make(map[uint16]node.SocketTableKey), SID: 0}
+	tcpStack := &TCPStack{ip: n.IpAddr, SocketTable: make(map[node.SocketTableKey]Socket), SID_to_sk: make(map[uint16]node.SocketTableKey), SID: 0}
 
 	// handle matching process
 	go func() {
@@ -80,11 +80,11 @@ func Initialize(n *node.Node) TCPStack {
 			received := <-n.TCPChan
 
 			// server and client flipped??
-			if sock, ok := tcpStack.socketTable[node.SocketTableKey{ClientAddr: received.ServerAddr, ClientPort: received.ServerPort, ServerAddr: received.ClientAddr, ServerPort: received.ClientPort}]; ok {
+			if sock, ok := tcpStack.SocketTable[node.SocketTableKey{ClientAddr: received.ServerAddr, ClientPort: received.ServerPort, ServerAddr: received.ClientAddr, ServerPort: received.ClientPort}]; ok {
 				sock.(*NormalSocket).normalChan <- received
 			} else {
 				listenTuple := node.SocketTableKey{ClientPort: received.ServerPort}
-				if sock, ok := tcpStack.socketTable[listenTuple]; ok {
+				if sock, ok := tcpStack.SocketTable[listenTuple]; ok {
 					sock.(*ListenSocket).listenChan <- received
 				}
 			}
@@ -96,14 +96,14 @@ func Initialize(n *node.Node) TCPStack {
 func (t *TCPStack) VListen(port uint16) (*ListenSocket, error) {
 	SocketTableKey := new(node.SocketTableKey)
 	SocketTableKey.ClientPort = port
-	if _, ok := t.socketTable[*SocketTableKey]; ok {
+	if _, ok := t.SocketTable[*SocketTableKey]; ok {
 		// already listening on port
 		return nil, fmt.Errorf("already listening on port %d", port)
 	}
 	lsock := &ListenSocket{localPort: port, listenChan: make(chan node.TCPInfo), SID: t.SID} // TODO: chan blocking?
 	t.SID_to_sk[t.SID] = *SocketTableKey
 	t.SID++
-	t.socketTable[*SocketTableKey] = lsock
+	t.SocketTable[*SocketTableKey] = lsock
 	return lsock, nil
 }
 
@@ -113,7 +113,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	for {
 		randSrcPort = uint16(rand.Intn(65535-20000) + 20000)
 		SocketTableKey := &node.SocketTableKey{ClientPort: randSrcPort}
-		if _, ok := t.socketTable[*SocketTableKey]; !ok {
+		if _, ok := t.SocketTable[*SocketTableKey]; !ok {
 			break
 		}
 	}
@@ -126,7 +126,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	}
 	t.SID_to_sk[t.SID] = *sk
 	t.SID++
-	t.socketTable[*sk] = newSocket
+	t.SocketTable[*sk] = newSocket
 
 	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, rand.Uint32(), 0)
 	i := 0
@@ -176,7 +176,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	newSocket.baseAck = ci.SeqNum
 	newSocket.baseSeq = ci.AckNum - 1
 
-	t.socketTable[*sk].(*NormalSocket).state = ESTABLISHED
+	t.SocketTable[*sk].(*NormalSocket).state = ESTABLISHED
 	tcpPacket = makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagAck, randSrcPort, destPort, ci.AckNum, ci.SeqNum+1)
 	// establish connection
 	n.HandleSend(destAddr, tcpPacket, 6)
@@ -214,7 +214,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 	}
 	t.SID_to_sk[t.SID] = sk
 	t.SID++
-	t.socketTable[sk] = newSocket
+	t.SocketTable[sk] = newSocket
 
 	newSocket.baseAck = ci.SeqNum
 	newSocket.baseSeq = rand.Uint32()
@@ -320,7 +320,7 @@ func (socket *ListenSocket) printSocket() {
 
 func (t *TCPStack) PrintTable() {
 	fmt.Println("SID      LAddr LPort      RAddr RPort       Status")
-	for _, socket := range t.socketTable {
+	for _, socket := range t.SocketTable {
 		socket.printSocket()
 	}
 }

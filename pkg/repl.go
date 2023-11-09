@@ -114,18 +114,18 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 				continue
 			}
 			// check socket ID is valid
-			sk, ok := t.SID_to_sk[sock]
+			sk, ok := t.SID_to_sk[uint16(sock)]
 			if !ok {
 				fmt.Println("Could not find socket")
 			}
-			if sk.ClientAddr == nil {
-				fmt.Println("Socket ID corresponds to listening socket")
-			}
-			socket, ok := t.socketTable[sk]
+			// if sk.ClientAddr == nil {
+			// 	fmt.Println("Socket ID corresponds to listening socket")
+			// }
+			socket, ok := t.SocketTable[sk]
 			if !ok {
 				fmt.Println("Could not find socket")
 			}
-			socket.VRead(num)
+			socket.(*tcpstack.NormalSocket).VRead(uint16(num))
 
 		case "cl":
 			fmt.Println("to do")
