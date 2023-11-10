@@ -84,7 +84,7 @@ func Initialize(n *node.Node) TCPStack {
 			if ok && sock.(*NormalSocket).state != SYN_RECEIVED {
 				sock.(*NormalSocket).normalChan <- received
 			} else {
-				listenTuple := node.SocketTableKey{ClientPort: received.ServerPort}
+				listenTuple := node.SocketTableKey{LocalPort: received.RemotePort}
 				if sock, ok := tcpStack.SocketTable[listenTuple]; ok {
 					sock.(*ListenSocket).listenChan <- received
 				}
@@ -96,16 +96,16 @@ func Initialize(n *node.Node) TCPStack {
 
 func flipSocketKeyFields(sk node.SocketTableKey) node.SocketTableKey {
 	return node.SocketTableKey{
-		ClientAddr: sk.ServerAddr,
-		ClientPort: sk.ServerPort,
-		ServerAddr: sk.ClientAddr,
-		ServerPort: sk.ClientPort,
+		LocalAddr:  sk.RemoteAddr,
+		LocalPort:  sk.RemotePort,
+		RemoteAddr: sk.LocalAddr,
+		RemotePort: sk.LocalPort,
 	}
 }
 
 func (t *TCPStack) VListen(port uint16) (*ListenSocket, error) {
 	SocketTableKey := new(node.SocketTableKey)
-	SocketTableKey.ClientPort = port
+	SocketTableKey.LocalPort = port
 	if _, ok := t.SocketTable[*SocketTableKey]; ok {
 		// already listening on port
 		return nil, fmt.Errorf("already listening on port %d", port)
@@ -121,15 +121,15 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	var randSrcPort uint16
 	for {
 		randSrcPort = uint16(rand.Intn(65535-20000) + 20000)
-		SocketTableKey := &node.SocketTableKey{ClientPort: randSrcPort}
+		SocketTableKey := &node.SocketTableKey{LocalPort: randSrcPort}
 		if _, ok := t.SocketTable[*SocketTableKey]; !ok {
 			break
 		}
 	}
 	// TESTING:
-	randSrcPort = 20000
+	// randSrcPort = 20000
 
-	sk := node.SocketTableKey{ClientAddr: t.ip, ClientPort: randSrcPort, ServerAddr: destAddr, ServerPort: destPort}
+	sk := node.SocketTableKey{LocalAddr: t.ip, LocalPort: randSrcPort, RemoteAddr: destAddr, RemotePort: destPort}
 	newSocket := &NormalSocket{
 		SID:            t.SID,
 		state:          SYN_SENT,
@@ -142,16 +142,14 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 
 	seqNum := rand.Uint32()
 	// TESTING
-	seqNum = 5000
+	// seqNum = 5000
 	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, seqNum, 0, 65535)
 	i := 0
 	var ci node.TCPInfo
 	timeout := make(chan bool)
 	// TO FIX: it never processes that true is passed into timeout, gets stuck at select block
 	for {
-		if i > 0 {
-			n.HandleSend(destAddr, tcpPacket, 6)
-		}
+		n.HandleSend(destAddr, tcpPacket, 6)
 		go func(tmt chan bool) { // TODO: test timeout stuff
 			time.Sleep(3 * time.Second)
 			tmt <- true
@@ -202,7 +200,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, error) {
 	// wait for SYN
 	var ci node.TCPInfo
-	for !(ci.Flag == header.TCPFlagSyn && ci.SocketTableKey.ServerPort == lsock.localPort) {
+	for !(ci.Flag == header.TCPFlagSyn && ci.SocketTableKey.RemotePort == lsock.localPort) {
 		ci = <-lsock.listenChan
 	}
 	sk := ci.SocketTableKey
@@ -236,15 +234,15 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 	newSocket.baseSeq = rand.Uint32()
 	newSocket.ClientWindowSize = 65535
 	// TESTING
-	newSocket.baseSeq = 6000
+	// newSocket.baseSeq = 6000
 
 	// send SYN+ACK back to client
-	tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, nil, SYNACK, sk.ServerPort, sk.ClientPort, newSocket.baseSeq, ci.SeqNum+1, 65535)
+	tcpPacket := makeTCPPacket(sk.RemoteAddr, sk.LocalAddr, nil, SYNACK, sk.RemotePort, sk.LocalPort, newSocket.baseSeq, ci.SeqNum+1, 65535)
 
-	n.HandleSend(sk.ClientAddr, tcpPacket, 6)
+	n.HandleSend(sk.LocalAddr, tcpPacket, 6)
 
 	// wait for final packet to establish TCP
-	for !(ci.Flag == header.TCPFlagAck && ci.SocketTableKey.ServerPort == lsock.localPort) {
+	for !(ci.Flag == header.TCPFlagAck && ci.SocketTableKey.RemotePort == lsock.localPort) {
 		ci = <-lsock.listenChan
 	}
 	newSocket.state = ESTABLISHED
@@ -318,9 +316,9 @@ func (socket *NormalSocket) SenderThread(n *node.Node) {
 			ack_num := socket.readBuffer.NXT + socket.baseAck
 			new_window := (socket.readBuffer.LBR - socket.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE
 
-			tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, payload, header.TCPFlagAck, sk.ServerPort, sk.ClientPort, seq_num, ack_num, uint16(new_window))
-			fmt.Printf("the address: %s\n", sk.ClientAddr.String())
-			n.HandleSend(sk.ClientAddr, tcpPacket, 6)
+			tcpPacket := makeTCPPacket(sk.RemoteAddr, sk.LocalAddr, payload, header.TCPFlagAck, sk.RemotePort, sk.LocalPort, seq_num, ack_num, uint16(new_window))
+			// fmt.Printf("the address: %s\n", sk.LocalAddr.String())
+			n.HandleSend(sk.LocalAddr, tcpPacket, 6)
 		}
 
 	}
@@ -355,8 +353,8 @@ func (socket *NormalSocket) ReceiverThread(n *node.Node) {
 			// need to send packet
 			sk := received.SocketTableKey
 			new_ack_num := socket.readBuffer.NXT + socket.baseAck
-			tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, nil, header.TCPFlagAck, sk.ServerPort, sk.ClientPort, received.AckNum, new_ack_num, uint16(new_window))
-			n.HandleSend(sk.ClientAddr, tcpPacket, 6)
+			tcpPacket := makeTCPPacket(sk.RemoteAddr, sk.LocalAddr, nil, header.TCPFlagAck, sk.RemotePort, sk.LocalPort, received.AckNum, new_ack_num, uint16(new_window))
+			n.HandleSend(sk.LocalAddr, tcpPacket, 6)
 		}
 	}
 }
@@ -410,7 +408,7 @@ func (socket *ListenSocket) VClose() error {
 
 func (socket *NormalSocket) printSocket() {
 	fmt.Printf("  %d   %8s %5d   %8s %5d %12s\n", socket.SID,
-		socket.ClientAddr, socket.ClientPort, socket.ServerAddr, socket.ServerPort, stateMap[socket.state])
+		socket.LocalAddr, socket.LocalPort, socket.RemoteAddr, socket.RemotePort, stateMap[socket.state])
 }
 
 func (socket *ListenSocket) printSocket() {
