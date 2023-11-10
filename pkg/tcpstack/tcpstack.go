@@ -78,9 +78,9 @@ func Initialize(n *node.Node) TCPStack {
 	go func() {
 		for {
 			received := <-n.TCPChan
-
-			// server and client flipped??
-			if sock, ok := tcpStack.SocketTable[node.SocketTableKey{ClientAddr: received.ServerAddr, ClientPort: received.ServerPort, ServerAddr: received.ClientAddr, ServerPort: received.ClientPort}]; ok {
+			key := flipSocketKeyFields(received.SocketTableKey)
+			sock, ok := tcpStack.SocketTable[key]
+			if ok && sock.(*NormalSocket).state != SYN_RECEIVED {
 				sock.(*NormalSocket).normalChan <- received
 			} else {
 				listenTuple := node.SocketTableKey{ClientPort: received.ServerPort}
@@ -91,6 +91,15 @@ func Initialize(n *node.Node) TCPStack {
 		}
 	}()
 	return *tcpStack
+}
+
+func flipSocketKeyFields(sk node.SocketTableKey) node.SocketTableKey {
+	return node.SocketTableKey{
+		ClientAddr: sk.ServerAddr,
+		ClientPort: sk.ServerPort,
+		ServerAddr: sk.ClientAddr,
+		ServerPort: sk.ClientPort,
+	}
 }
 
 func (t *TCPStack) VListen(port uint16) (*ListenSocket, error) {
@@ -116,18 +125,24 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 			break
 		}
 	}
-	sk := &node.SocketTableKey{ClientAddr: t.ip, ClientPort: randSrcPort, ServerAddr: destAddr, ServerPort: destPort}
+	// TESTING:
+	randSrcPort = 20000
+
+	sk := node.SocketTableKey{ClientAddr: t.ip, ClientPort: randSrcPort, ServerAddr: destAddr, ServerPort: destPort}
 	newSocket := &NormalSocket{
 		SID:            t.SID,
 		state:          SYN_SENT,
-		SocketTableKey: *sk,
+		SocketTableKey: sk,
 		normalChan:     make(chan node.TCPInfo), // TODO: chan blocking?
 	}
-	t.SID_to_sk[t.SID] = *sk
+	t.SID_to_sk[t.SID] = sk
 	t.SID++
-	t.SocketTable[*sk] = newSocket
+	t.SocketTable[sk] = newSocket
 
-	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, rand.Uint32(), 0)
+	seqNum := rand.Uint32()
+	// TESTING
+	seqNum = 5000
+	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, seqNum, 0)
 	i := 0
 	var ci node.TCPInfo
 	timeout := make(chan bool)
@@ -174,7 +189,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	newSocket.baseAck = ci.SeqNum
 	newSocket.baseSeq = ci.AckNum - 1
 
-	t.SocketTable[*sk].(*NormalSocket).state = ESTABLISHED
+	t.SocketTable[sk].(*NormalSocket).state = ESTABLISHED
 	tcpPacket = makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagAck, randSrcPort, destPort, ci.AckNum, ci.SeqNum+1)
 	// establish connection
 	n.HandleSend(destAddr, tcpPacket, 6)
@@ -202,20 +217,23 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		LBW:    0,
 	}
 	// create new normal socket
+	newSK := flipSocketKeyFields(sk)
 	newSocket := &NormalSocket{
 		SID:            t.SID,
 		readBuffer:     new_read,
 		writeBuffer:    new_send,
 		state:          SYN_RECEIVED,
-		SocketTableKey: sk,
-		normalChan:     make(chan node.TCPInfo), // TODO: chan blocking?
+		SocketTableKey: newSK,
+		normalChan:     make(chan node.TCPInfo),
 	}
-	t.SID_to_sk[t.SID] = sk
+	t.SID_to_sk[t.SID] = newSK
 	t.SID++
-	t.SocketTable[sk] = newSocket
+	t.SocketTable[newSK] = newSocket
 
 	newSocket.baseAck = ci.SeqNum
 	newSocket.baseSeq = rand.Uint32()
+	// TESTING
+	newSocket.baseSeq = 6000
 
 	// send SYN+ACK back to client
 	tcpPacket := makeTCPPacket(sk.ServerAddr, sk.ClientAddr, nil, SYNACK, sk.ServerPort, sk.ClientPort, newSocket.baseSeq, ci.SeqNum+1)
@@ -266,37 +284,41 @@ func makeTCPPacket(sourceIp netip.Addr, destIp netip.Addr,
 // FOR SENDER + RECEIVER: later if we need to deal with clean shutdowns, im guessing channels would work here (or some sort of var)
 
 func (socket *NormalSocket) SenderThread() {
-	// // i think the whole channel thing is prolly applicable here; wake up when new stuff written?
-	// // actually not too sure
-	// // ok ok it should be like
-	// /*
-	// 	for {
-	// 		if (ack is not caught up) {
-	// 			// logic
-	// 		}
-	// 		else {
-	// 			all caught up now, just need to wait for new stuff to be written
+	// i think the whole channel thing is prolly applicable here; wake up when new stuff written?
+	// actually not too sure
+	// ok ok it should be like
+	/*
+		for {
+			if (ack is not caught up) {
+				// logic
+			}
+			else {
+				all caught up now, just need to wait for new stuff to be written
 
-	// 			use channel to wake up this thread
-	// 		}
-	// 	}
-	// */
-	// panic("todo")
-	return
+				use channel to wake up this thread
+			}
+		}
+	*/
+	for {
+
+	}
 }
 
 func (socket *NormalSocket) ReceiverThread() {
 	// this should be more straight forward??
 	// p sure its just direct impl
-	// var received node.TCPInfo
-	// for {
-	// 	received = <-socket.normalChan
-	// 	if received.Flag == header.TCPFlagAck {
-	// 		// update read buffer pointers
-	// 		// write the payload to the read buffer
-	// 	}
-	// }
-	return
+	var received node.TCPInfo
+	for {
+		received = <-socket.normalChan
+		if received.Flag == header.TCPFlagAck {
+			// update read buffer pointers
+			// write the payload to the read buffer
+			// assume for now that bytes are guaranteed to be in order
+			socket.readBuffer.NXT = received.AckNum
+			socket.readBuffer.buffer = append(socket.readBuffer.buffer, received.Payload...)
+			fmt.Printf("receiver thread: ack %d, %s\n", received.AckNum, socket.readBuffer.buffer)
+		}
+	}
 }
 
 func (socket *NormalSocket) VWrite(message []byte) error {
