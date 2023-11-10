@@ -3,9 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
-	repl "iptcp/pkg"
 	"iptcp/pkg/lnxconfig"
 	"iptcp/pkg/node"
+	repl "iptcp/pkg/repl"
 	"log"
 )
 
