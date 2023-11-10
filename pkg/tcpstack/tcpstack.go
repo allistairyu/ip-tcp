@@ -130,16 +130,15 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	tcpPacket := makeTCPPacket(t.ip, destAddr, nil, header.TCPFlagSyn, randSrcPort, destPort, rand.Uint32(), 0)
 	i := 0
 	var ci node.TCPInfo
-	var timeout chan bool
+	timeout := make(chan bool)
 	// TO FIX: it never processes that true is passed into timeout, gets stuck at select block
 	for {
-		fmt.Println("hello")
-		n.HandleSend(destAddr, tcpPacket, 6)
+		if i > 0 {
+			n.HandleSend(destAddr, tcpPacket, 6)
+		}
 		go func(tmt chan bool) { // TODO: test timeout stuff
 			time.Sleep(3 * time.Second)
-			fmt.Println("slept")
 			tmt <- true
-			return
 		}(timeout)
 		select {
 		case ci = <-newSocket.normalChan: // wait until protocol6 confirms
