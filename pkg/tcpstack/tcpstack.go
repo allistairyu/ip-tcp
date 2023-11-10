@@ -7,6 +7,7 @@ import (
 	"iptcp/pkg/node"
 	"math/rand"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/google/netstack/tcpip/header"
@@ -36,9 +37,11 @@ type TCPStack struct {
 }
 
 type ReadBuffer struct {
-	buffer []byte
-	LBR    uint32
-	NXT    uint32
+	buffer   []byte
+	readMtx  *sync.Mutex
+	readCond *sync.Cond
+	LBR      uint32
+	NXT      uint32
 	// add some sort of queue for out of order
 }
 
@@ -172,10 +175,13 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 			return &NormalSocket{}, errors.New("could not connect")
 		}
 	}
+	readMtx := sync.Mutex{}
 	new_read := &ReadBuffer{
-		buffer: make([]byte, WINDOW_SIZE),
-		LBR:    0,
-		NXT:    1,
+		buffer:   make([]byte, WINDOW_SIZE),
+		LBR:      0,
+		NXT:      1,
+		readMtx:  &readMtx,
+		readCond: sync.NewCond(&readMtx),
 	}
 	new_send := &WriteBuffer{
 		buffer: make([]byte, WINDOW_SIZE),
@@ -347,7 +353,10 @@ func (socket *NormalSocket) ReceiverThread(n *node.Node) {
 
 			copy(socket.readBuffer.buffer[socket.readBuffer.NXT:socket.readBuffer.NXT+uint32(len(received.Payload))], received.Payload)
 
+			socket.readBuffer.readMtx.Lock()
 			socket.readBuffer.NXT = (received.SeqNum + uint32(len(received.Payload)) - socket.baseAck + WINDOW_SIZE) % WINDOW_SIZE
+			socket.readBuffer.readCond.Broadcast()
+			socket.readBuffer.readMtx.Unlock()
 
 			new_window := (socket.readBuffer.LBR - socket.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE
 			// need to send packet
@@ -381,6 +390,18 @@ func (socket *NormalSocket) VWrite(message []byte) error {
 
 func (socket *NormalSocket) VRead(numbytes uint16) error {
 	num_buf := (socket.readBuffer.NXT - 1 - socket.readBuffer.LBR + WINDOW_SIZE) % WINDOW_SIZE
+
+	// block if num_buf == 0
+	socket.readBuffer.readMtx.Lock()
+	for num_buf == 0 {
+		socket.readBuffer.readCond.Wait()
+		num_buf = (socket.readBuffer.NXT - 1 - socket.readBuffer.LBR + WINDOW_SIZE) % WINDOW_SIZE
+		if num_buf > 0 {
+			break
+		}
+	}
+	socket.readBuffer.readMtx.Unlock()
+
 	num_read := min(num_buf, uint32(numbytes))
 
 	// read up to this
