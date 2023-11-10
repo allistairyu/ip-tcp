@@ -97,6 +97,7 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 				norm, err := t.VConnect(addr, uint16(port), node)
 				if err != nil {
 					fmt.Printf("Error: %s\n", err)
+					continue
 				}
 				go norm.SenderThread()
 				go norm.ReceiverThread()
@@ -104,10 +105,31 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 		case "ls":
 			t.PrintTable()
 		case "s":
-			fmt.Println("to do")
+			if len(tokens) != 3 {
+				fmt.Println("s usage: s <socketID> <bytes>")
+				continue
+			}
+			sock, err := strconv.ParseUint(tokens[1], 10, 16)
+			if err != nil {
+				fmt.Println("Could not parse socket ID as int")
+				continue
+			}
+			// check socket ID is valid
+			sk, ok := t.SID_to_sk[uint16(sock)]
+			if !ok {
+				fmt.Println("Could not find socket")
+				continue
+			}
+			socket, ok := t.SocketTable[sk]
+			if !ok {
+				fmt.Println("Could not find socket")
+				continue
+			}
+			socket.(*tcpstack.NormalSocket).VWrite([]byte(tokens[2]))
 		case "r":
 			if len(tokens) != 3 {
 				fmt.Println("r usage: r <socket ID> <numbytes>")
+				continue
 			}
 			sock, err := strconv.ParseUint(tokens[1], 10, 16)
 			if err != nil {
@@ -123,11 +145,13 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 			sk, ok := t.SID_to_sk[uint16(sock)]
 			if !ok {
 				fmt.Println("Could not find socket")
+				continue
 			}
 
 			socket, ok := t.SocketTable[sk]
 			if !ok {
 				fmt.Println("Could not find socket")
+				continue
 			}
 			socket.(*tcpstack.NormalSocket).VRead(uint16(num))
 

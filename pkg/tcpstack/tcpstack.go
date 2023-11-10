@@ -266,39 +266,57 @@ func makeTCPPacket(sourceIp netip.Addr, destIp netip.Addr,
 // FOR SENDER + RECEIVER: later if we need to deal with clean shutdowns, im guessing channels would work here (or some sort of var)
 
 func (socket *NormalSocket) SenderThread() {
-	// i think the whole channel thing is prolly applicable here; wake up when new stuff written?
-	// actually not too sure
-	// ok ok it should be like
-	/*
-		for {
-			if (ack is not caught up) {
-				// logic
-			}
-			else {
-				all caught up now, just need to wait for new stuff to be written
+	// // i think the whole channel thing is prolly applicable here; wake up when new stuff written?
+	// // actually not too sure
+	// // ok ok it should be like
+	// /*
+	// 	for {
+	// 		if (ack is not caught up) {
+	// 			// logic
+	// 		}
+	// 		else {
+	// 			all caught up now, just need to wait for new stuff to be written
 
-				use channel to wake up this thread
-			}
-		}
-	*/
-	panic("todo")
+	// 			use channel to wake up this thread
+	// 		}
+	// 	}
+	// */
+	// panic("todo")
+	return
 }
 
 func (socket *NormalSocket) ReceiverThread() {
 	// this should be more straight forward??
 	// p sure its just direct impl
-	var received node.TCPInfo
-	for {
-		received = <-socket.normalChan
-		if received.Flag == header.TCPFlagAck {
-			// update read buffer pointers
-			// write the payload to the read buffer
-		}
-	}
+	// var received node.TCPInfo
+	// for {
+	// 	received = <-socket.normalChan
+	// 	if received.Flag == header.TCPFlagAck {
+	// 		// update read buffer pointers
+	// 		// write the payload to the read buffer
+	// 	}
+	// }
+	return
 }
 
-func (socket *NormalSocket) VWrite() error {
-	panic("todo")
+func (socket *NormalSocket) VWrite(message []byte) error {
+	// first get how much left to write: this is LBW to UNA (so writing from LBW + 1 to UNA - 1)
+	space := (socket.writeBuffer.UNA - 1 - socket.writeBuffer.LBW + WINDOW_SIZE) % WINDOW_SIZE
+	if space == 0 {
+		space = WINDOW_SIZE
+	}
+	to_write := min(uint32(len(message)), space)
+	to_write = min(to_write, uint32(node.MaxMessageSize-40)) // max is maxmsg - ip header - tcp header
+
+	first_seg := min(WINDOW_SIZE-socket.writeBuffer.LBW, to_write)
+	second_seg := to_write - first_seg
+
+	copy(socket.writeBuffer.buffer[socket.writeBuffer.LBW:first_seg], message[:first_seg])
+	copy(socket.writeBuffer.buffer[:second_seg], message[first_seg:first_seg+second_seg])
+
+	// update pointer
+	socket.writeBuffer.LBW = (socket.writeBuffer.LBW + to_write) % WINDOW_SIZE
+	return nil
 }
 
 func (socket *NormalSocket) VRead(numbytes uint16) error {
