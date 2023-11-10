@@ -105,7 +105,7 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 		case "ls":
 			t.PrintTable()
 		case "s":
-			if len(tokens) != 3 {
+			if len(tokens) < 3 {
 				fmt.Println("s usage: s <socketID> <bytes>")
 				continue
 			}

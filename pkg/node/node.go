@@ -53,10 +53,10 @@ type Node struct {
 }
 
 type SocketTableKey struct {
-	ClientAddr netip.Addr
-	ClientPort uint16
-	ServerAddr netip.Addr
-	ServerPort uint16
+	LocalAddr  netip.Addr
+	LocalPort  uint16
+	RemoteAddr netip.Addr
+	RemotePort uint16
 }
 
 // TODO: rename lol
@@ -176,10 +176,10 @@ func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
 	// fmt.Printf("Received TCP packet from %s\nIP Header:  %v\nIP Checksum:  %s\nTCP header:  %+v\nFlags:  %s\nTCP Checksum:  %s\nPayload (%d bytes):  %s\n",
 	// "0.0.0.0", hdr, "OK", tcpHdr, iptcp_utils.TCPFlagsAsString(tcpHdr.Flags),
 	// tcpChecksumState, len(tcpPayload), string(tcpPayload))
-	sk := SocketTableKey{ClientAddr: hdr.Src,
-		ClientPort: tcpHdr.SrcPort,
-		ServerAddr: node.IpAddr,
-		ServerPort: tcpHdr.DstPort,
+	sk := SocketTableKey{LocalAddr: hdr.Src,
+		LocalPort:  tcpHdr.SrcPort,
+		RemoteAddr: node.IpAddr,
+		RemotePort: tcpHdr.DstPort,
 	}
 	node.TCPChan <- TCPInfo{SocketTableKey: sk,
 		Flag:       tcpHdr.Flags,
