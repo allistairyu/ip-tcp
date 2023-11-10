@@ -121,7 +121,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		SID:            t.SID,
 		state:          SYN_SENT,
 		SocketTableKey: *sk,
-		normalChan:     make(chan node.TCPInfo), // TODO: chan blocking?
+		normalChan:     make(chan node.TCPInfo),
 	}
 	t.SID_to_sk[t.SID] = *sk
 	t.SID++
@@ -131,12 +131,9 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	i := 0
 	var ci node.TCPInfo
 	timeout := make(chan bool)
-	// TO FIX: it never processes that true is passed into timeout, gets stuck at select block
 	for {
-		if i > 0 {
-			n.HandleSend(destAddr, tcpPacket, 6)
-		}
-		go func(tmt chan bool) { // TODO: test timeout stuff
+		n.HandleSend(destAddr, tcpPacket, 6)
+		go func(tmt chan bool) {
 			time.Sleep(3 * time.Second)
 			tmt <- true
 		}(timeout)
@@ -281,7 +278,9 @@ func (socket *NormalSocket) SenderThread() {
 			}
 		}
 	*/
-	panic("todo")
+	for {
+
+	}
 }
 
 func (socket *NormalSocket) ReceiverThread() {
