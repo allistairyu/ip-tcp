@@ -620,7 +620,7 @@ func (node *Node) ToggleInterface(name string, b bool) error {
 	} else {
 		iface.enableMutex.Lock()
 		iface.enabled = b
-		iface.enableCond.Broadcast()
+		iface.enableCond.Signal()
 		iface.enableMutex.Unlock()
 	}
 	return nil

@@ -26,7 +26,7 @@ func listenAndAccept(port uint16, t *tcpstack.TCPStack, n *node.Node) error {
 	}
 }
 
-func REPL(node *node.Node, t *tcpstack.TCPStack) {
+func REPL(n *node.Node, t *tcpstack.TCPStack) {
 	reader := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
 	for reader.Scan() {
@@ -35,16 +35,16 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 		tokens := strings.Split(command, " ")
 		switch tokens[0] {
 		case "li":
-			node.PrintInterfaces()
+			n.PrintInterfaces()
 		case "ln":
-			node.PrintNeighbors()
+			n.PrintNeighbors()
 		case "lr":
-			node.PrintRoutes()
+			n.PrintRoutes()
 		case "down":
 			if len(tokens) != 2 {
 				fmt.Println("down usage: down <ifname>")
 			} else {
-				err := node.ToggleInterface(tokens[1], false)
+				err := n.ToggleInterface(tokens[1], false)
 				if err != nil {
 					fmt.Println("Invalid interface")
 				}
@@ -53,7 +53,7 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 			if len(tokens) != 2 {
 				fmt.Println("up usage: up <ifname>")
 			} else {
-				err := node.ToggleInterface(tokens[1], true)
+				err := n.ToggleInterface(tokens[1], true)
 				if err != nil {
 					fmt.Println("Invalid interface")
 				}
@@ -63,11 +63,11 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 				fmt.Println("send usage: send <vip> <message ...>")
 			} else {
 				parsed_addr := netip.MustParseAddr(tokens[1])
-				_, _, found := node.FindNext(parsed_addr) // where to forward to; our "source"
+				_, _, found := n.FindNext(parsed_addr) // where to forward to; our "source"
 				if !found {
 					fmt.Println("Error: No match in forwarding table.")
 				} else {
-					node.HandleSend(parsed_addr, []byte(strings.Join(tokens[2:], " ")), 0)
+					n.HandleSend(parsed_addr, []byte(strings.Join(tokens[2:], " ")), 0)
 				}
 			}
 		case "a":
@@ -78,7 +78,7 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 				if err != nil {
 					fmt.Println("Could not parse port as int")
 				}
-				go listenAndAccept(uint16(port), t, node)
+				go listenAndAccept(uint16(port), t, n)
 			}
 		case "c":
 			if len(tokens) != 3 {
@@ -94,13 +94,13 @@ func REPL(node *node.Node, t *tcpstack.TCPStack) {
 					fmt.Println("Could not parse address")
 					continue
 				}
-				norm, err := t.VConnect(addr, uint16(port), node)
+				norm, err := t.VConnect(addr, uint16(port), n)
 				if err != nil {
 					fmt.Printf("Error: %s\n", err)
 					continue
 				}
-				go norm.SenderThread(node)
-				go norm.ReceiverThread(node)
+				go norm.SenderThread(n)
+				go norm.ReceiverThread(n)
 			}
 		case "ls":
 			t.PrintTable()
