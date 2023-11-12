@@ -24,7 +24,7 @@ const (
 const WINDOW_SIZE = 1 << 16
 
 // TESTING
-// const WINDOW_SIZE = 5
+const MSS = uint16(1)
 
 var stateMap = map[uint8]string{
 	LISTEN:       "LISTEN",
@@ -46,8 +46,16 @@ type ReadBuffer struct {
 	readCond *sync.Cond
 	LBR      uint32
 	NXT      uint32
-	// add some sort of queue for out of order
+	// earlyPQ  EarlyPQ // priority queue
 }
+
+// type EarlyPQ []*EarlyPacket
+
+// type EarlyPacket struct {
+// 	priority int // should be received.SeqNum?
+// 	index    int
+// 	TCPPacket
+// }
 
 type WriteBuffer struct {
 	buffer    []byte
@@ -59,7 +67,7 @@ type WriteBuffer struct {
 }
 
 type Socket interface {
-	// VClose()
+	VClose() error
 	printSocket()
 }
 
@@ -80,7 +88,6 @@ type NormalSocket struct {
 	ClientWindowSize uint16
 	chans            map[uint32]chan bool // ACK num -> channel between receiver thread and sliding window thread
 	// chansMtx         sync.Mutex
-	// earlyQueue []TCPPacket
 	node.SocketTableKey
 }
 
@@ -391,9 +398,8 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.writeBuffer.writeMtx.Unlock()
 			sock.readBuffer.readMtx.Unlock()
 
-			// TODO: handle rest of this function with slidingWindow routine
 			fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
-			sock.slidingWindow(packet, n) // MAKE GO ROUTINE
+			go sock.slidingWindow(packet, n)
 		}
 	}
 	// sock.writeBuffer.writeMtx.Unlock()
@@ -406,32 +412,30 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	bytesSent := 0
 	// sock.writeBuffer.writeMtx.Lock()
 	tail := &WindowNode{
-		// index:  uint16(s.writeBuffer.UNA),
 		index:  0,
 		next:   nil,
 		acked:  false,
 		packet: packet,
 	}
 	head := &WindowNode{
-		index:  0,
-		next:   tail,
-		acked:  true,
-		packet: TCPPacket{},
+		next:  tail,
+		acked: true,
 	}
 	window := Window{
 		head: head,
 		tail: tail,
 	}
 	// sock.writeBuffer.writeMtx.Unlock()
-	// TESTING
-	MSS := uint16(1)
-
+	segment := 0
 	for bytesSent < len(packet.payload) {
-		segment := 0
-		numBytesChan := make(chan int, 5) // chan buffer length should be smth like WINDOW_SIZE / MSS == (max num of segments we will ever send)
-		for window.tail.index-window.head.index < min(uint16(len(packet.payload)), WINDOW_SIZE-1) {
+
+		// for window.tail.index-window.head.index < min(uint16(len(packet.payload)), WINDOW_SIZE-1) {
+		// TESTING
+		for window.tail.index-window.head.index < 2 {
+
 			// make deep copy of cur tail's packet, with diff payload, window
-			curPayload := packet.payload[window.tail.index : window.tail.index+MSS] // TODO: account for last segment size <= MSS and wrap around
+			bytesToSend := min(MSS, uint16(len(packet.payload))-window.tail.index) // last segment will have fewer than MSS bytes
+			curPayload := packet.payload[window.tail.index : window.tail.index+bytesToSend]
 			curPacket := TCPPacket{
 				sourceIp:   window.tail.packet.sourceIp,
 				destIp:     window.tail.packet.destIp,
@@ -451,14 +455,16 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 				packet: curPacket,
 			}
 			tail.next = nextNode
-			go func(tcpPacket *TCPPacket, wn *WindowNode, numBytesChan chan int) { // MAKE GO ROUTINE
+
+			// doesn't make sense send segments concurrently right... bytes would
+			// almost always be out of order
+			numBytes := func(tcpPacket *TCPPacket, wn *WindowNode, bytesToSend int) int {
 				// send, wait for ack, retransmit
 				// sock.writeBuffer.writeMtx.Lock()
-				bytesToSend := MSS // TODO: last segment will be smaller than MSS
 				sock.writeBuffer.NXT += uint32(bytesToSend)
 				// sock.writeBuffer.writeMtx.Unlock()
 				packet := tcpPacket.marshallTCPPacket()
-				fmt.Printf("segment %d: %d bytes: %s\n", segment, MSS, string(curPayload))
+				fmt.Printf("segment %d: %d bytes: %s\n", segment, bytesToSend, string(curPayload))
 
 				i := 0
 				timeout := make(chan bool)
@@ -470,7 +476,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 				for {
 					n.HandleSend(sock.RemoteAddr, packet, 6)
 					go func(tmt chan bool) {
-						time.Sleep(1000 * time.Second) // TESTING make a lot shorter (see specs)
+						time.Sleep(30 * time.Millisecond)
 						tmt <- true
 					}(timeout)
 					select {
@@ -481,8 +487,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 						fmt.Printf("try num: %d\n", i)
 						if i == 3 {
 							delete(sock.chans, expectedAck)
-							numBytesChan <- 0
-							return
+							return 0
 						}
 						continue
 					}
@@ -493,24 +498,19 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 				delete(sock.chans, expectedAck)
 				// sock.chansMtx.Unlock()
 
-				numBytesChan <- int(bytesToSend)
-			}(&curPacket, tail, numBytesChan)
+				return int(bytesToSend)
+			}(&curPacket, tail, int(bytesToSend))
 
+			bytesSent += numBytes
 			segment++
 			tail = tail.next
 			window.tail = tail
-		}
-		for j := 0; j < 5; j++ {
-			n := <-numBytesChan
-			if n == 0 { // one of the packets was not successfully acked
-				return
-			}
-			bytesSent += n
 		}
 		if bytesSent == len(packet.payload) {
 			return
 		}
 		for window.head != window.tail && window.head.acked {
+			fmt.Printf("Popped head %d\n", window.head.index)
 			window.head = window.head.next
 		}
 	}
@@ -522,10 +522,9 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 		received = <-sock.normalChan
 		if received.Flag == header.TCPFlagAck {
 			sock.ClientWindowSize = received.WindowSize
-			// ignore packets whose contents should already be acked by a
+			// TODO: ignore packets whose contents should already be acked by a
 			// previous packet with higher ack
-			// TODO: account for wrap around case where we don't want to ignore
-			// this
+			// account for wrap around
 			// if received.AckNum <= sock.writeBuffer.UNA ||
 			// 	received.AckNum > sock.writeBuffer.NXT {
 			// 	continue
@@ -542,6 +541,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 			}
 			// sock.chansMtx.Unlock()
 
+			// TODO: account for when window runs out of space
 			// update read buffer pointers
 			// write the payload to the read buffer
 			// TODO: wrap around case
@@ -549,11 +549,17 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 
 			// cond variable for blocking in VRead
 			sock.readBuffer.readMtx.Lock()
+
+			// ignore if this packet isn't in order
+			if received.SeqNum != sock.baseAck+sock.readBuffer.NXT {
+				continue
+			}
+
 			sock.readBuffer.NXT = (received.SeqNum + uint32(len(received.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
 			sock.readBuffer.readCond.Broadcast()
 			sock.readBuffer.readMtx.Unlock()
 
-			new_window := (sock.readBuffer.LBR - sock.readBuffer.NXT + 1 + WINDOW_SIZE) % WINDOW_SIZE
+			new_window := (sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE
 			// need to send packet
 			sk := received.SocketTableKey
 			new_ack_num := sock.readBuffer.NXT + sock.baseAck
@@ -654,3 +660,44 @@ func (t *TCPStack) PrintTable() {
 		sock.printSocket()
 	}
 }
+
+/*
+https://pkg.go.dev/container/heap#example-package-PriorityQueue
+
+func (pq EarlyPQ) Len() int { return len(pq) }
+
+func (pq EarlyPQ) Less(i, j int) bool {
+	return pq[i].priority < pq[j].priority
+}
+
+func (pq EarlyPQ) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].index = i
+	pq[j].index = j
+}
+
+func (pq *EarlyPQ) Push(x any) {
+	n := len(*pq)
+	item := x.(*EarlyPacket)
+	item.index = n
+	*pq = append(*pq, item)
+}
+
+func (pq *EarlyPQ) Pop() any {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil  // avoid memory leak
+	item.index = -1 // for safety
+	*pq = old[0 : n-1]
+	return item
+}
+
+// update modifies the priority and value of an Item in the queue.
+func (pq *EarlyPQ) update(item *EarlyPacket, packet TCPPacket, priority int) {
+	item.TCPPacket = packet
+	item.priority = priority
+	heap.Fix(pq, item.index)
+}
+
+*/
