@@ -11,7 +11,7 @@
 			"mode": "auto",
 			"program": "${workspaceFolder}/cmd/vhost",
 			"console": "integratedTerminal",
-			"args": ["--config", "${workspaceFolder}/r1h2-test/h1.lnx"]
+			"args": ["--config", "${workspaceFolder}/tests/linear-r1h2/h1.lnx"]
 		},
 		{
 			"name": "Launch h2",
@@ -20,7 +20,7 @@
 			"mode": "auto",
 			"program": "${workspaceFolder}/cmd/vhost",
 			"console": "integratedTerminal",
-			"args": ["--config", "${workspaceFolder}/r1h2-test/h2.lnx"]
+			"args": ["--config", "${workspaceFolder}/tests/linear-r1h2/h2.lnx"]
 		}
 	]
 }
