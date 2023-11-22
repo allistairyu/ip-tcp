@@ -15,7 +15,7 @@
 
 # Binaries for submission
 ./host
-./vhost
+/vhost
 ./router
-./vrouter
-
+/vrouter
+__debug_bin*
