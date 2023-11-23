@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iptcp/pkg/iptcp_utils"
 	"iptcp/pkg/node"
+	"iptcp/pkg/pq"
 	"math/rand"
 	"net/netip"
 	"sync"
@@ -49,14 +50,6 @@ type ReadBuffer struct {
 	NXT      uint32
 }
 
-type EarlyPriorityQueue []*EarlyPacket
-
-type EarlyPacket struct {
-	priority uint32
-	index    int
-	payload  []byte
-}
-
 type WriteBuffer struct {
 	buffer    []byte
 	writeMtx  *sync.Mutex // protect pointers
@@ -89,7 +82,7 @@ type NormalSocket struct {
 	ackChan          chan uint32
 	unackedNums      map[uint32]bool
 	unackedMtx       *sync.Mutex
-	earlyPQ          EarlyPriorityQueue // priority queue
+	earlyPQ          pq.EarlyPriorityQueue // priority queue
 	index            int
 	node.SocketTableKey
 }
@@ -256,7 +249,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	// newSocket.chans = make(map[uint32]chan bool)
 	newSocket.ackChan = make(chan uint32, 100) // should at most have WINDOW_SIZE values?
 	newSocket.unackedNums = make(map[uint32]bool)
-	newSocket.earlyPQ = make(EarlyPriorityQueue, 0)
+	newSocket.earlyPQ = make(pq.EarlyPriorityQueue, 0)
 	newSocket.index = 0
 	newSocket.unackedMtx = &sync.Mutex{}
 
@@ -315,7 +308,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		normalChan:     make(chan node.TCPInfo, 100),
 		ackChan:        make(chan uint32, 100),
 		unackedNums:    make(map[uint32]bool),
-		earlyPQ:        make(EarlyPriorityQueue, 0),
+		earlyPQ:        make(pq.EarlyPriorityQueue, 0),
 		index:          0,
 		unackedMtx:     &sync.Mutex{},
 	}
@@ -386,6 +379,7 @@ func (p TCPPacket) marshallTCPPacket() []byte {
 
 func (sock *NormalSocket) SenderThread(n *node.Node) {
 	sock.writeBuffer.writeMtx.Lock()
+	defer sock.writeBuffer.writeMtx.Unlock()
 	for {
 		// wait for LBW/NXT fields to be updated by VWrite
 		sock.writeBuffer.writeCond.Wait()
@@ -415,8 +409,6 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			go sock.slidingWindow(packet, n)
 		}
 	}
-	// sock.writeBuffer.writeMtx.Unlock()
-	// TODO: need to unlock eventually?
 }
 
 func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
@@ -439,7 +431,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 		window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
 	}
 	packet.payload = packet.payload[bytesToSend:]
-	// sock.writeBuffer.NXT += uint32(bytesToSend)
+	// sock.writeBuffer.NXT += uint32(bytesToSend) // move NXT?
 	tail := &WindowNode{
 		payloadIndex: 0,
 		packet:       firstPacket,
@@ -457,7 +449,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	bytesSent := 0
 	startTime := time.Now()
 	for bytesSent < payloadSize {
-		if window.tail.index-window.head.next.index < 3 && bytesToSend > 0 { // window size of 3 for now
+		if window.tail.index-window.head.next.index < 3 && bytesToSend > 0 { // window size of 3 for testing
 			sock.writeBuffer.NXT += uint32(bytesToSend)
 
 			expectedAck := sock.writeBuffer.NXT + sock.baseSeq
@@ -495,19 +487,23 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 			}
 		}
 
-		// check received ACK packets and shrink window accordingly
+		// check which packets were ACKed
 		for len(sock.ackChan) > 0 {
 			receivedAck := <-sock.ackChan
 			delete(sock.unackedNums, receivedAck)
 
-			// if we received an ACK ahead of UNA (can ignore ACKs before UNA)
-			if receivedAck > sock.writeBuffer.UNA+sock.baseSeq { // TODO: wrap around
+			// if we received an ACK ahead of UNA (can ignore ACKs before UNA
+			// except wrap around case!!)
+			if receivedAck > sock.writeBuffer.UNA+sock.baseSeq {
 				bytesSent += int(receivedAck - sock.writeBuffer.UNA - sock.baseSeq)
 				sock.writeBuffer.UNA = receivedAck - sock.baseSeq
+				// shrink window from head
 				for window.head.expectedAck < receivedAck {
 					window.head = window.head.next
 				}
-
+				// reset timer if head of window was received; TODO: maybe
+				// window.next.head.expectedAck instead of UNA+baseseq
+				// if receivedAck == window.head.next.expectedAck {
 				if receivedAck == sock.writeBuffer.UNA+sock.baseSeq {
 					startTime = time.Now()
 				}
@@ -518,14 +514,12 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 		// if first segment in window hasn't been acked within RTO? (<-- need to
 		// calculate), resend entire window (Go-Back-N algo)
 		if time.Since(startTime).Milliseconds() > 200 {
-			// if time.Since(startTime).Seconds() > 30 {
 			startTime = time.Now()
 			temp := window.head
 			for temp != nil {
 				p := temp.packet.marshallTCPPacket()
 				n.HandleSend(sock.RemoteAddr, p, 6)
 				// fmt.Printf("Resent packet, expecting ACK: %d\n", temp.expectedAck)
-
 				temp = temp.next
 			}
 		}
@@ -571,28 +565,29 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 
 			// put into early queue if packet is out of order
 			if received.SeqNum > sock.baseAck+sock.readBuffer.NXT {
-				ep := EarlyPacket{
-					priority: received.SeqNum, // need to handle wrap around
-					index:    sock.index,
-					payload:  received.Payload,
+				ep := pq.EarlyPacket{
+					Priority: received.SeqNum, // need to handle wrap around
+					Index:    sock.index,
+					Payload:  received.Payload,
 				}
 				heap.Push(&sock.earlyPQ, &ep) // pq is ordered by seqnum
-				goto sendack                  // send duplicate ACK instead of continuing
+				goto sendack                  // send duplicate ACK
 				// continue
 			}
 
+			// insert packet payload into read buffer
 			sock.readBuffer.readMtx.Lock()
 			copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(received.Payload))], received.Payload)
 			sock.readBuffer.NXT = (received.SeqNum + uint32(len(received.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
 
 			// insert early arrival packets if possible
-			for len(sock.earlyPQ) > 0 && sock.earlyPQ[0].priority <= sock.readBuffer.NXT+sock.baseAck { //TODO: wrap around
-				if sock.earlyPQ[0].priority != sock.readBuffer.NXT { // packet was already copied into buffer
+			for len(sock.earlyPQ) > 0 && sock.earlyPQ[0].Priority <= sock.readBuffer.NXT+sock.baseAck { //TODO: wrap around
+				if sock.earlyPQ[0].Priority != sock.readBuffer.NXT { // packet was already copied into buffer
 					heap.Pop(&sock.earlyPQ)
 				} else {
-					earlyPacket := heap.Pop(&sock.earlyPQ).(*EarlyPacket)
-					copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(earlyPacket.payload))], earlyPacket.payload)
-					sock.readBuffer.NXT = (earlyPacket.priority + uint32(len(earlyPacket.payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
+					earlyPacket := heap.Pop(&sock.earlyPQ).(*pq.EarlyPacket)
+					copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(earlyPacket.Payload))], earlyPacket.Payload)
+					sock.readBuffer.NXT = (earlyPacket.Priority + uint32(len(earlyPacket.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
 					// fmt.Printf("inserted out of order payload: %s\n", string(early.payload))
 				}
 			}
@@ -600,7 +595,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 			sock.readBuffer.readCond.Broadcast() // or signal? to unblock VRead
 			sock.readBuffer.readMtx.Unlock()
 
-		sendack:
+		sendack: // send back ACK
 			new_window := (sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE
 			sk := received.SocketTableKey
 			new_ack_num := sock.readBuffer.NXT + sock.baseAck
@@ -649,7 +644,7 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 func (sock *NormalSocket) VRead(numbytes uint16) error {
 	num_buf := (sock.readBuffer.NXT - 1 - sock.readBuffer.LBR + WINDOW_SIZE) % WINDOW_SIZE
 
-	// block if num_buf == 0
+	// block if nothing to read
 	sock.readBuffer.readMtx.Lock()
 	defer sock.readBuffer.readMtx.Unlock()
 	for num_buf == 0 {
@@ -701,35 +696,4 @@ func (t *TCPStack) PrintTable() {
 	for _, sock := range t.SocketTable {
 		sock.printSocket()
 	}
-}
-
-// https://pkg.go.dev/container/heap#example-package-PriorityQueue
-
-func (pq EarlyPriorityQueue) Len() int { return len(pq) }
-
-func (pq EarlyPriorityQueue) Less(i, j int) bool {
-	return pq[i].priority < pq[j].priority
-}
-
-func (pq EarlyPriorityQueue) Swap(i, j int) {
-	pq[i], pq[j] = pq[j], pq[i]
-	pq[i].index = i
-	pq[j].index = j
-}
-
-func (pq *EarlyPriorityQueue) Push(x any) {
-	n := len(*pq)
-	item := x.(*EarlyPacket)
-	item.index = n
-	*pq = append(*pq, item)
-}
-
-func (pq *EarlyPriorityQueue) Pop() any {
-	old := *pq
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = nil  // avoid memory leak
-	item.index = -1 // for safety
-	*pq = old[0 : n-1]
-	return item
 }
