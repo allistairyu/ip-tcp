@@ -86,14 +86,12 @@ type NormalSocket struct {
 	baseSeq          uint32
 	baseAck          uint32
 	ClientWindowSize uint16
-	// chans            map[uint32]chan bool // ACK num -> channel between
-	// receiver thread and sliding window thread
-	ackChan     chan uint32
-	unackedNums map[uint32]bool
-	// chansMtx         sync.Mutex
+	ackChan          chan uint32
+	unackedNums      map[uint32]bool
+	unackedMtx       *sync.Mutex
+	earlyPQ          EarlyPriorityQueue // priority queue
+	index            int
 	node.SocketTableKey
-	earlyPQ EarlyPriorityQueue // priority queue
-	index   int
 }
 
 type TCPPacket struct {
@@ -116,9 +114,9 @@ type Window struct {
 type WindowNode struct {
 	payloadIndex uint16
 	next         *WindowNode
-	acked        bool
 	expectedAck  uint32
 	packet       *TCPPacket
+	index        uint32
 	// lastSent time.Time
 }
 
@@ -133,7 +131,7 @@ func Initialize(n *node.Node) TCPStack {
 			sock, ok := tcpStack.SocketTable[key]
 			if ok && sock.(*NormalSocket).state != SYN_RECEIVED {
 				sock.(*NormalSocket).normalChan <- received
-			} else {
+			} else { // add something here for passive close
 				listenTuple := node.SocketTableKey{LocalPort: received.RemotePort}
 				if sock, ok := tcpStack.SocketTable[listenTuple]; ok {
 					sock.(*ListenSocket).listenChan <- received
@@ -260,6 +258,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	newSocket.unackedNums = make(map[uint32]bool)
 	newSocket.earlyPQ = make(EarlyPriorityQueue, 0)
 	newSocket.index = 0
+	newSocket.unackedMtx = &sync.Mutex{}
 
 	t.SocketTable[sk].(*NormalSocket).state = ESTABLISHED
 	tcpPacket = TCPPacket{
@@ -314,11 +313,11 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		state:          SYN_RECEIVED,
 		SocketTableKey: newSK,
 		normalChan:     make(chan node.TCPInfo, 100),
-		// chans:          make(map[uint32]chan bool),
-		ackChan:     make(chan uint32, 100),
-		unackedNums: make(map[uint32]bool),
-		earlyPQ:     make(EarlyPriorityQueue, 0),
-		index:       0,
+		ackChan:        make(chan uint32, 100),
+		unackedNums:    make(map[uint32]bool),
+		earlyPQ:        make(EarlyPriorityQueue, 0),
+		index:          0,
+		unackedMtx:     &sync.Mutex{},
 	}
 	t.SID_to_sk[t.SID] = newSK
 	t.SID++
@@ -413,7 +412,7 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.readBuffer.readMtx.Unlock()
 
 			fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
-			sock.slidingWindow(packet, n)
+			go sock.slidingWindow(packet, n)
 		}
 	}
 	// sock.writeBuffer.writeMtx.Unlock()
@@ -423,10 +422,11 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	// for testing purposes, split total payload into segments of size 1
 	// should eventually be MSS (max ip packet size - ip header - tcp header)
-	// bytesSent := 0
 	// sock.writeBuffer.writeMtx.Lock()
-	bytesToSend := min(MSS, uint16(len(packet.payload)))
-	ackToNode := make(map[uint32]*WindowNode)
+	payloadSize := len(packet.payload)
+
+	// allocate first node/packet to send
+	bytesToSend := min(int(MSS), len(packet.payload))
 	firstPacket := &TCPPacket{
 		sourceIp:   sock.LocalAddr,
 		destIp:     sock.RemoteAddr,
@@ -444,27 +444,34 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 		payloadIndex: 0,
 		packet:       firstPacket,
 		expectedAck:  sock.writeBuffer.NXT + uint32(bytesToSend) + sock.baseSeq,
+		index:        0,
+	}
+	head := &WindowNode{
+		next: tail,
 	}
 	window := Window{
-		head: tail,
+		head: head,
 		tail: tail,
 	}
-	ackToNode[tail.expectedAck] = tail
-	// acked := make(map[uint32]bool)
+
+	bytesSent := 0
 	startTime := time.Now()
-	finalNXT := sock.writeBuffer.NXT + uint32(len(packet.payload)) + 1
-	for sock.writeBuffer.NXT < finalNXT { // TODO: can't rely on this if multiple things are being sent, also wrap around
-		if sock.writeBuffer.NXT-sock.writeBuffer.UNA < 3 { // window size of 3 for now
+	for bytesSent < payloadSize {
+		if window.tail.index-window.head.next.index < 3 && bytesToSend > 0 { // window size of 3 for now
 			sock.writeBuffer.NXT += uint32(bytesToSend)
+
 			expectedAck := sock.writeBuffer.NXT + sock.baseSeq
-			p := window.tail.packet.marshallTCPPacket()
+			sock.unackedMtx.Lock()
 			sock.unackedNums[expectedAck] = true
+			sock.unackedMtx.Unlock()
+
+			p := window.tail.packet.marshallTCPPacket()
 			n.HandleSend(sock.RemoteAddr, p, 6)
-			fmt.Printf("Sent packet, expecting ACK: %d\n", expectedAck)
+			// fmt.Printf("Sent packet, expecting ACK: %d\n", expectedAck)
 
 			// allocate next window node
-			bytesToSend = min(MSS, uint16(len(packet.payload))-window.tail.payloadIndex) // last segment will have fewer than MSS bytes
-			if len(packet.payload) > 0 {                                                 // don't need to make next packet if no more bytes to send
+			bytesToSend = min(int(MSS), payloadSize-int(window.tail.payloadIndex), len(packet.payload)) // last segment will have fewer than MSS bytes
+			if bytesToSend > 0 {                                                                        // don't need to make next packet if no more bytes to send
 				nextPacket := &TCPPacket{
 					sourceIp:   window.tail.packet.sourceIp,
 					destIp:     window.tail.packet.destIp,
@@ -480,33 +487,44 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 				nextNode := &WindowNode{
 					payloadIndex: window.tail.payloadIndex + MSS,
 					packet:       nextPacket,
-					expectedAck:  expectedAck,
+					expectedAck:  expectedAck + uint32(bytesToSend),
+					index:        window.tail.index + 1,
 				}
-				ackToNode[expectedAck] = nextNode
 				window.tail.next = nextNode
 				window.tail = window.tail.next
 			}
 		}
 
+		// check received ACK packets and shrink window accordingly
 		for len(sock.ackChan) > 0 {
 			receivedAck := <-sock.ackChan
-			// delete(sock.unackedNums, receivedAck)
-			sock.writeBuffer.UNA = receivedAck - sock.baseSeq // TODO: handle packets received out of order
-			window.head = ackToNode[receivedAck]
-			if receivedAck == sock.writeBuffer.NXT+sock.baseSeq {
-				startTime = time.Now()
+			delete(sock.unackedNums, receivedAck)
+
+			// if we received an ACK ahead of UNA (can ignore ACKs before UNA)
+			if receivedAck > sock.writeBuffer.UNA+sock.baseSeq { // TODO: wrap around
+				bytesSent += int(receivedAck - sock.writeBuffer.UNA - sock.baseSeq)
+				sock.writeBuffer.UNA = receivedAck - sock.baseSeq
+				for window.head.expectedAck < receivedAck {
+					window.head = window.head.next
+				}
+
+				if receivedAck == sock.writeBuffer.UNA+sock.baseSeq {
+					startTime = time.Now()
+				}
+				// fmt.Printf("Received ACK: %d\n", receivedAck)
 			}
-			fmt.Printf("Received ACK: %d\n", receivedAck)
 		}
 
-		// if first segment in window hasn't been acked within RTO?, resend everything
+		// if first segment in window hasn't been acked within RTO? (<-- need to
+		// calculate), resend entire window (Go-Back-N algo)
 		if time.Since(startTime).Milliseconds() > 200 {
+			// if time.Since(startTime).Seconds() > 30 {
 			startTime = time.Now()
 			temp := window.head
 			for temp != nil {
 				p := temp.packet.marshallTCPPacket()
 				n.HandleSend(sock.RemoteAddr, p, 6)
-				fmt.Printf("Resent packet, expecting ACK: %d\n", temp.expectedAck)
+				// fmt.Printf("Resent packet, expecting ACK: %d\n", temp.expectedAck)
 
 				temp = temp.next
 			}
@@ -520,7 +538,6 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 	ignore := 0
 	for {
 		received = <-sock.normalChan
-		fmt.Printf("received: %+v\n\n\n", received)
 		if received.Flag == header.TCPFlagAck {
 			ignore++
 			sock.ClientWindowSize = received.WindowSize
@@ -535,64 +552,56 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 			// sock.writeBuffer.UNA = (received.AckNum - sock.baseSeq + WINDOW_SIZE) % WINDOW_SIZE
 
 			// here we received an ack packet in response to what we sent
-			// sock.chansMtx.Lock()
-			if _, ok := sock.unackedNums[received.AckNum]; ok { // possible that ack num is same, fix
+			sock.unackedMtx.Lock()
+			if _, ok := sock.unackedNums[received.AckNum]; ok { // TODO: possible that this received ACK num is in map but not an ACK in response to what we sent
 				sock.ackChan <- received.AckNum
-				// sock.chansMtx.Unlock()
+				sock.unackedMtx.Unlock()
 				continue
 			}
-			// sock.chansMtx.Unlock()
+			sock.unackedMtx.Unlock()
 
 			// SLIDING WINDOW TESTING: don't ack second packet received
-			if ignore == 3 {
-				continue
-			}
+			// if ignore == 3 {
+			// 	continue
+			// }
 
 			// TODO: account for when window runs out of space
 			// update read buffer pointers
 			// write the payload to the read buffer
-			// TODO: wrap around case
 
 			// put into early queue if packet is out of order
-			if received.SeqNum != sock.baseAck+sock.readBuffer.NXT {
+			if received.SeqNum > sock.baseAck+sock.readBuffer.NXT {
 				ep := EarlyPacket{
 					priority: received.SeqNum, // need to handle wrap around
 					index:    sock.index,
 					payload:  received.Payload,
 				}
-				heap.Push(&sock.earlyPQ, &ep)
-				fmt.Print("early queue: [")
-				for _, v := range sock.earlyPQ {
-					fmt.Printf("%d ", v.priority)
-				}
-				fmt.Println("]")
-				continue
+				heap.Push(&sock.earlyPQ, &ep) // pq is ordered by seqnum
+				goto sendack                  // send duplicate ACK instead of continuing
+				// continue
 			}
-			// cond variable for blocking in VRead
+
 			sock.readBuffer.readMtx.Lock()
-
 			copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(received.Payload))], received.Payload)
-
 			sock.readBuffer.NXT = (received.SeqNum + uint32(len(received.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
 
 			// insert early arrival packets if possible
-			for len(sock.earlyPQ) > 0 && sock.earlyPQ[0].priority <= sock.readBuffer.NXT+sock.baseAck {
-				if sock.earlyPQ[0].priority < sock.readBuffer.NXT { // packet was already copied into buffer; TODO: wrap around
-					fmt.Println("payload already inserted")
+			for len(sock.earlyPQ) > 0 && sock.earlyPQ[0].priority <= sock.readBuffer.NXT+sock.baseAck { //TODO: wrap around
+				if sock.earlyPQ[0].priority != sock.readBuffer.NXT { // packet was already copied into buffer
 					heap.Pop(&sock.earlyPQ)
 				} else {
-					early := heap.Pop(&sock.earlyPQ).(*EarlyPacket)
-					copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(early.payload))], early.payload)
-					sock.readBuffer.NXT = (early.priority + uint32(len(early.payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
-					fmt.Printf("inserted out of order payload: %s\n", string(early.payload))
+					earlyPacket := heap.Pop(&sock.earlyPQ).(*EarlyPacket)
+					copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(earlyPacket.payload))], earlyPacket.payload)
+					sock.readBuffer.NXT = (earlyPacket.priority + uint32(len(earlyPacket.payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
+					// fmt.Printf("inserted out of order payload: %s\n", string(early.payload))
 				}
 			}
 
-			sock.readBuffer.readCond.Broadcast()
+			sock.readBuffer.readCond.Broadcast() // or signal? to unblock VRead
 			sock.readBuffer.readMtx.Unlock()
 
+		sendack:
 			new_window := (sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE
-			// need to send packet
 			sk := received.SocketTableKey
 			new_ack_num := sock.readBuffer.NXT + sock.baseAck
 			tcpPacket := TCPPacket{
@@ -670,6 +679,7 @@ func (sock *NormalSocket) VRead(numbytes uint16) error {
 }
 
 func (sock *NormalSocket) VClose() error {
+
 	panic("todo")
 }
 
@@ -723,10 +733,3 @@ func (pq *EarlyPriorityQueue) Pop() any {
 	*pq = old[0 : n-1]
 	return item
 }
-
-// // update modifies the priority and value of an Item in the queue.
-// func (pq *EarlyPriorityQueue) update(item *EarlyPacket, payload []byte, priority uint32) {
-// 	item.payload = payload
-// 	item.priority = priority
-// 	heap.Fix(pq, item.index)
-// }
