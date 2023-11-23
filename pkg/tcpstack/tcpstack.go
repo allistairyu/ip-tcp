@@ -571,8 +571,9 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 					Payload:  received.Payload,
 				}
 				heap.Push(&sock.earlyPQ, &ep) // pq is ordered by seqnum
-				goto sendack                  // send duplicate ACK
-				// continue
+				// goto sendack                  // TODO: send duplicate ACK,
+				// currently this causes some bug
+				continue
 			}
 
 			// insert packet payload into read buffer
@@ -582,7 +583,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 
 			// insert early arrival packets if possible
 			for len(sock.earlyPQ) > 0 && sock.earlyPQ[0].Priority <= sock.readBuffer.NXT+sock.baseAck { //TODO: wrap around
-				if sock.earlyPQ[0].Priority != sock.readBuffer.NXT { // packet was already copied into buffer
+				if sock.earlyPQ[0].Priority < sock.readBuffer.NXT { // packet was already copied into buffer
 					heap.Pop(&sock.earlyPQ)
 				} else {
 					earlyPacket := heap.Pop(&sock.earlyPQ).(*pq.EarlyPacket)
@@ -595,7 +596,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 			sock.readBuffer.readCond.Broadcast() // or signal? to unblock VRead
 			sock.readBuffer.readMtx.Unlock()
 
-		sendack: // send back ACK
+			// sendack: // send back ACK
 			new_window := (sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE
 			sk := received.SocketTableKey
 			new_ack_num := sock.readBuffer.NXT + sock.baseAck
