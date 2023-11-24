@@ -1,5 +1,14 @@
 package tcpstack
 
+/*
+TODO: i think this is all that's left...
+- VClose stuff; i'll do this first
+- RTO calculation for sliding window timeout
+- send/receive file
+- zero window probing
+	- take care of wrap around edge case
+*/
+
 import (
 	"container/heap"
 	"errors"
@@ -20,7 +29,13 @@ const (
 	SYN_SENT
 	SYN_RECEIVED
 	ESTABLISHED
+	FIN_WAIT_1
+	FIN_WAIT_2
+	CLOSE_WAIT
+	LAST_ACK
+	TIME_WAIT
 	SYNACK = uint8(header.TCPFlagSyn | header.TCPFlagAck)
+	FINACK = uint8(header.TCPFlagFin | header.TCPFlagAck)
 )
 
 const WINDOW_SIZE = 1 << 16
@@ -60,7 +75,7 @@ type WriteBuffer struct {
 }
 
 type Socket interface {
-	VClose() error
+	VClose(*node.Node) error
 	printSocket()
 }
 
@@ -80,10 +95,13 @@ type NormalSocket struct {
 	baseAck          uint32
 	ClientWindowSize uint16
 	ackChan          chan uint32
+	finChan          chan uint32
 	unackedNums      map[uint32]bool
+	unackedFINs      map[uint32]bool
 	unackedMtx       *sync.Mutex
 	earlyPQ          pq.EarlyPriorityQueue // priority queue
 	index            int
+	closed           bool
 	node.SocketTableKey
 }
 
@@ -247,11 +265,13 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	newSocket.baseSeq = ci.AckNum - 1
 	newSocket.ClientWindowSize = 65535
 	// newSocket.chans = make(map[uint32]chan bool)
-	newSocket.ackChan = make(chan uint32, 100) // should at most have WINDOW_SIZE values?
+	newSocket.ackChan = make(chan uint32, 100) // is 100 the right size
+	newSocket.finChan = make(chan uint32)
 	newSocket.unackedNums = make(map[uint32]bool)
 	newSocket.earlyPQ = make(pq.EarlyPriorityQueue, 0)
 	newSocket.index = 0
 	newSocket.unackedMtx = &sync.Mutex{}
+	newSocket.unackedFINs = make(map[uint32]bool)
 
 	t.SocketTable[sk].(*NormalSocket).state = ESTABLISHED
 	tcpPacket = TCPPacket{
@@ -307,7 +327,9 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		SocketTableKey: newSK,
 		normalChan:     make(chan node.TCPInfo, 100),
 		ackChan:        make(chan uint32, 100),
+		finChan:        make(chan uint32),
 		unackedNums:    make(map[uint32]bool),
+		unackedFINs:    make(map[uint32]bool),
 		earlyPQ:        make(pq.EarlyPriorityQueue, 0),
 		index:          0,
 		unackedMtx:     &sync.Mutex{},
@@ -383,7 +405,7 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 	for {
 		// wait for LBW/NXT fields to be updated by VWrite
 		sock.writeBuffer.writeCond.Wait()
-		if sock.writeBuffer.LBW >= sock.writeBuffer.NXT {
+		if sock.writeBuffer.LBW >= sock.writeBuffer.NXT && !sock.closed {
 			// stuff to send
 			amount_to_send := (sock.writeBuffer.LBW - sock.writeBuffer.NXT + 1 + WINDOW_SIZE) % WINDOW_SIZE
 			amount_to_send = min(amount_to_send, uint32(sock.ClientWindowSize))
@@ -532,7 +554,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 	ignore := 0
 	for {
 		received = <-sock.normalChan
-		if received.Flag == header.TCPFlagAck {
+		if received.Flag|header.TCPFlagAck > 0 {
 			ignore++
 			sock.ClientWindowSize = received.WindowSize
 			// TODO: ignore packets whose contents should already be acked by a
@@ -543,10 +565,16 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 			// 	continue
 			// }
 
-			// sock.writeBuffer.UNA = (received.AckNum - sock.baseSeq + WINDOW_SIZE) % WINDOW_SIZE
+			// sock.writeBuffer.UNA = (received.AckNum - sock.baseSeq +
+			// WINDOW_SIZE) % WINDOW_SIZE
 
-			// here we received an ack packet in response to what we sent
 			sock.unackedMtx.Lock()
+			if _, ok := sock.unackedFINs[received.AckNum]; ok {
+				sock.finChan <- received.AckNum
+				sock.unackedMtx.Unlock()
+				continue
+			}
+			// here we received an ack packet in response to what we sent
 			if _, ok := sock.unackedNums[received.AckNum]; ok { // TODO: possible that this received ACK num is in map but not an ACK in response to what we sent
 				sock.ackChan <- received.AckNum
 				sock.unackedMtx.Unlock()
@@ -674,12 +702,43 @@ func (sock *NormalSocket) VRead(numbytes uint16) error {
 	return nil
 }
 
-func (sock *NormalSocket) VClose() error {
+func (sock *NormalSocket) VClose(n *node.Node) error {
+	// send FIN/ACK
+	packet := TCPPacket{
+		sourceIp:   sock.LocalAddr,
+		destIp:     sock.RemoteAddr,
+		payload:    nil,
+		flags:      FINACK,
+		sourcePort: sock.LocalPort,
+		destPort:   sock.RemotePort,
+		seqNum:     sock.writeBuffer.UNA + sock.baseSeq,
+		ackNum:     sock.readBuffer.NXT + sock.baseAck,
+		window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
+	}
+	p := packet.marshallTCPPacket()
+	if sock.state == ESTABLISHED {
+		sock.state = FIN_WAIT_1
+	} else if sock.state == CLOSE_WAIT {
+		sock.state = LAST_ACK
+	}
+	sock.closed = true // disable sending from this socket
+	sock.unackedMtx.Lock()
+	sock.unackedFINs[packet.ackNum+1] = true
+	sock.unackedMtx.Unlock()
 
-	panic("todo")
+	n.HandleSend(sock.RemoteAddr, p, 6)
+
+	for {
+		// TODO: retransmission?
+		receivedAck := <-sock.finChan
+		if receivedAck == packet.ackNum+1 {
+			return nil
+		}
+	}
+	return errors.New("socket termination failed")
 }
 
-func (sock *ListenSocket) VClose() error {
+func (sock *ListenSocket) VClose(n *node.Node) error {
 	panic("todo")
 }
 
