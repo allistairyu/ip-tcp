@@ -161,21 +161,15 @@ func (node *Node) protocol0(message Packet, header *ipv4header.IPv4Header) {
 func (node *Node) protocol6(message Packet, hdr *ipv4header.IPv4Header) {
 	tcpHeaderAndData := message
 	tcpHdr := iptcp_utils.ParseTCPHeader(tcpHeaderAndData)
-	// tcpPayload := tcpHeaderAndData[tcpHdr.DataOffset:]
-	// tcpChecksumFromHeader := tcpHdr.Checksum // Save original
+	tcpPayload := tcpHeaderAndData[tcpHdr.DataOffset:]
+	tcpChecksumFromHeader := tcpHdr.Checksum // Save original
 	tcpHdr.Checksum = 0
-	// tcpComputedChecksum := iptcp_utils.ComputeTCPChecksum(&tcpHdr, hdr.Src, hdr.Dst, tcpPayload)
+	tcpComputedChecksum := iptcp_utils.ComputeTCPChecksum(&tcpHdr, hdr.Src, hdr.Dst, tcpPayload)
 
-	// var tcpChecksumState string
-	// if tcpComputedChecksum == tcpChecksumFromHeader {
-	// 	tcpChecksumState = "OK"
-	// } else {
-	// 	tcpChecksumState = "FAIL"
-	// }
-	// Finally, print everything out
-	// fmt.Printf("Received TCP packet from %s\nIP Header:  %v\nIP Checksum:  %s\nTCP header:  %+v\nFlags:  %s\nTCP Checksum:  %s\nPayload (%d bytes):  %s\n",
-	// "0.0.0.0", hdr, "OK", tcpHdr, iptcp_utils.TCPFlagsAsString(tcpHdr.Flags),
-	// tcpChecksumState, len(tcpPayload), string(tcpPayload))
+	if tcpComputedChecksum != tcpChecksumFromHeader {
+		return
+	}
+
 	sk := SocketTableKey{LocalAddr: hdr.Src,
 		LocalPort:  tcpHdr.SrcPort,
 		RemoteAddr: node.IpAddr,
