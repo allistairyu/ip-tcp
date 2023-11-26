@@ -5,6 +5,7 @@ type EarlyPriorityQueue []*EarlyPacket
 type EarlyPacket struct {
 	Priority uint32
 	Index    int
+	Flags    uint8
 	Payload  []byte
 }
 

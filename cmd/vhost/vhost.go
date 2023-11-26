@@ -29,5 +29,5 @@ func main() {
 
 	}
 	t := tcpstack.Initialize(host)
-	repl.REPL(host, &t)
+	repl.REPL(host, t)
 }

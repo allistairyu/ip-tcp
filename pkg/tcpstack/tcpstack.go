@@ -48,13 +48,19 @@ var stateMap = map[uint8]string{
 	SYN_SENT:     "SYN_SENT",
 	SYN_RECEIVED: "SYN_RECEIVED",
 	ESTABLISHED:  "ESTABLISHED",
+	FIN_WAIT_1:   "FIN_WAIT_1",
+	FIN_WAIT_2:   "FIN_WAIT_2",
+	CLOSE_WAIT:   "CLOSE_WAIT",
+	LAST_ACK:     "LAST_ACK",
+	TIME_WAIT:    "TIME_WAIT",
 }
 
 type TCPStack struct {
-	SocketTable map[node.SocketTableKey]Socket
-	ip          netip.Addr
-	SID_to_sk   map[uint16]node.SocketTableKey
-	SID         uint16
+	SocketTable    map[node.SocketTableKey]Socket
+	ip             netip.Addr
+	SID_to_sk      map[uint16]node.SocketTableKey
+	SID            uint16
+	socketTableMtx *sync.Mutex
 }
 
 type ReadBuffer struct {
@@ -75,8 +81,9 @@ type WriteBuffer struct {
 }
 
 type Socket interface {
-	VClose(*node.Node) error
+	VClose(*node.Node, *TCPStack)
 	printSocket()
+	getSID() uint16
 }
 
 type ListenSocket struct {
@@ -99,9 +106,10 @@ type NormalSocket struct {
 	unackedNums      map[uint32]bool
 	unackedFINs      map[uint32]bool
 	unackedMtx       *sync.Mutex
-	earlyPQ          pq.EarlyPriorityQueue // priority queue
-	index            int
+	earlyPQ          pq.EarlyPriorityQueue
+	index            int // for priority queue/heap stuff
 	closed           bool
+	closedMtx        *sync.Mutex // for if socket is closed
 	node.SocketTableKey
 }
 
@@ -131,26 +139,40 @@ type WindowNode struct {
 	// lastSent time.Time
 }
 
-func Initialize(n *node.Node) TCPStack {
-	tcpStack := &TCPStack{ip: n.IpAddr, SocketTable: make(map[node.SocketTableKey]Socket), SID_to_sk: make(map[uint16]node.SocketTableKey), SID: 0}
+func Initialize(n *node.Node) *TCPStack {
+	t := &TCPStack{
+		ip:             n.IpAddr,
+		SocketTable:    make(map[node.SocketTableKey]Socket),
+		SID_to_sk:      make(map[uint16]node.SocketTableKey),
+		SID:            0,
+		socketTableMtx: &sync.Mutex{},
+	}
 
 	// handle matching process
-	go func() {
+	go func(t *TCPStack) {
 		for {
 			received := <-n.TCPChan
 			key := flipSocketKeyFields(received.SocketTableKey)
-			sock, ok := tcpStack.SocketTable[key]
+			t.socketTableMtx.Lock()
+			sock, ok := t.SocketTable[key]
+			t.socketTableMtx.Unlock()
+
 			if ok && sock.(*NormalSocket).state != SYN_RECEIVED {
 				sock.(*NormalSocket).normalChan <- received
 			} else { // add something here for passive close
 				listenTuple := node.SocketTableKey{LocalPort: received.RemotePort}
-				if sock, ok := tcpStack.SocketTable[listenTuple]; ok {
+
+				t.socketTableMtx.Lock()
+				sock, ok := t.SocketTable[listenTuple]
+				t.socketTableMtx.Unlock()
+
+				if ok {
 					sock.(*ListenSocket).listenChan <- received
 				}
 			}
 		}
-	}()
-	return *tcpStack
+	}(t)
+	return t
 }
 
 func flipSocketKeyFields(sk node.SocketTableKey) node.SocketTableKey {
@@ -170,8 +192,9 @@ func (t *TCPStack) VListen(port uint16) (*ListenSocket, error) {
 		return nil, fmt.Errorf("already listening on port %d", port)
 	}
 	lsock := &ListenSocket{localPort: port, listenChan: make(chan node.TCPInfo), SID: t.SID}
-	t.SID++
 	t.SocketTable[*SocketTableKey] = lsock
+	t.SID_to_sk[t.SID] = *SocketTableKey
+	t.SID++
 	return lsock, nil
 }
 
@@ -216,20 +239,16 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	packet := tcpPacket.marshallTCPPacket()
 	i := 0
 	var ci node.TCPInfo
-	timeout := make(chan bool)
+	timeout := time.NewTicker(3 * time.Second)
 	for {
 		n.HandleSend(destAddr, packet, 6)
-		go func(tmt chan bool) {
-			// TESTING: change back to 3
-			time.Sleep(30 * time.Second)
-			tmt <- true
-		}(timeout)
 		select {
 		case ci = <-newSocket.normalChan: // wait until protocol6 confirms
-		case <-timeout:
+		case <-timeout.C:
 			i++
 			fmt.Printf("try num: %d\n", i)
 			if i == 3 {
+				// TODO: delete sock
 				return &NormalSocket{}, errors.New("could not connect")
 			}
 			continue
@@ -239,6 +258,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		}
 		i++
 		if i == 3 {
+			// TODO: delete sock
 			return &NormalSocket{}, errors.New("could not connect")
 		}
 	}
@@ -272,6 +292,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	newSocket.index = 0
 	newSocket.unackedMtx = &sync.Mutex{}
 	newSocket.unackedFINs = make(map[uint32]bool)
+	newSocket.closedMtx = &sync.Mutex{}
 
 	t.SocketTable[sk].(*NormalSocket).state = ESTABLISHED
 	tcpPacket = TCPPacket{
@@ -333,6 +354,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		earlyPQ:        make(pq.EarlyPriorityQueue, 0),
 		index:          0,
 		unackedMtx:     &sync.Mutex{},
+		closedMtx:      &sync.Mutex{},
 	}
 	t.SID_to_sk[t.SID] = newSK
 	t.SID++
@@ -549,7 +571,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	fmt.Println("finished sending")
 }
 
-func (sock *NormalSocket) ReceiverThread(n *node.Node) {
+func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 	var received node.TCPInfo
 	ignore := 0
 	for {
@@ -596,28 +618,56 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 				ep := pq.EarlyPacket{
 					Priority: received.SeqNum, // need to handle wrap around
 					Index:    sock.index,
+					Flags:    received.Flag,
 					Payload:  received.Payload,
 				}
+				sock.index++
 				heap.Push(&sock.earlyPQ, &ep) // pq is ordered by seqnum
 				// goto sendack                  // TODO: send duplicate ACK,
 				// currently this causes some bug
 				continue
 			}
 
-			// insert packet payload into read buffer
+			// check if this is FIN
 			sock.readBuffer.readMtx.Lock()
-			copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(received.Payload))], received.Payload)
-			sock.readBuffer.NXT = (received.SeqNum + uint32(len(received.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
 
+			if received.Flag|header.TCPFlagFin > 0 {
+				sock.readBuffer.NXT += 1
+				if sock.state == ESTABLISHED {
+					sock.state = CLOSE_WAIT
+				} else if sock.state == FIN_WAIT_2 {
+					sock.state = TIME_WAIT
+					go func(t *TCPStack, sock *NormalSocket) {
+						time.Sleep(120 * time.Second)
+						t.deleteTCB(sock)
+					}(t, sock)
+				}
+			} else {
+				// insert packet payload into read buffer
+				copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(received.Payload))], received.Payload)
+				sock.readBuffer.NXT = (received.SeqNum + uint32(len(received.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
+			}
 			// insert early arrival packets if possible
 			for len(sock.earlyPQ) > 0 && sock.earlyPQ[0].Priority <= sock.readBuffer.NXT+sock.baseAck { //TODO: wrap around
 				if sock.earlyPQ[0].Priority < sock.readBuffer.NXT { // packet was already copied into buffer
 					heap.Pop(&sock.earlyPQ)
 				} else {
 					earlyPacket := heap.Pop(&sock.earlyPQ).(*pq.EarlyPacket)
-					copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(earlyPacket.Payload))], earlyPacket.Payload)
-					sock.readBuffer.NXT = (earlyPacket.Priority + uint32(len(earlyPacket.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
-					// fmt.Printf("inserted out of order payload: %s\n", string(early.payload))
+					// check if this is FIN
+					if earlyPacket.Flags|header.TCPFlagFin > 0 {
+						if sock.state == ESTABLISHED {
+							sock.state = CLOSE_WAIT
+						} else if sock.state == FIN_WAIT_2 {
+							sock.state = TIME_WAIT
+							go func(t *TCPStack, sock *NormalSocket) {
+								time.Sleep(120 * time.Second)
+								t.deleteTCB(sock)
+							}(t, sock)
+						}
+					} else {
+						copy(sock.readBuffer.buffer[sock.readBuffer.NXT:sock.readBuffer.NXT+uint32(len(earlyPacket.Payload))], earlyPacket.Payload)
+						sock.readBuffer.NXT = (earlyPacket.Priority + uint32(len(earlyPacket.Payload)) - sock.baseAck + WINDOW_SIZE) % WINDOW_SIZE
+					}
 				}
 			}
 
@@ -646,6 +696,13 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node) {
 }
 
 func (sock *NormalSocket) VWrite(message []byte) error {
+	sock.closedMtx.Lock()
+	if sock.closed {
+		sock.closedMtx.Unlock()
+		return errors.New("sock closed")
+	}
+	sock.closedMtx.Unlock()
+
 	// first get how much left to write: this is LBW to UNA (so writing from LBW
 	// + 1 to UNA - 1)
 	sock.writeBuffer.writeMtx.Lock()
@@ -671,6 +728,13 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 }
 
 func (sock *NormalSocket) VRead(numbytes uint16) error {
+	sock.closedMtx.Lock()
+	if sock.closed {
+		sock.closedMtx.Unlock()
+		return errors.New("sock closed")
+	}
+	sock.closedMtx.Unlock()
+
 	num_buf := (sock.readBuffer.NXT - 1 - sock.readBuffer.LBR + WINDOW_SIZE) % WINDOW_SIZE
 
 	// block if nothing to read
@@ -702,7 +766,7 @@ func (sock *NormalSocket) VRead(numbytes uint16) error {
 	return nil
 }
 
-func (sock *NormalSocket) VClose(n *node.Node) error {
+func (sock *NormalSocket) VClose(n *node.Node, t *TCPStack) {
 	// send FIN/ACK
 	packet := TCPPacket{
 		sourceIp:   sock.LocalAddr,
@@ -721,25 +785,48 @@ func (sock *NormalSocket) VClose(n *node.Node) error {
 	} else if sock.state == CLOSE_WAIT {
 		sock.state = LAST_ACK
 	}
+	sock.closedMtx.Lock()
 	sock.closed = true // disable sending from this socket
+	sock.closedMtx.Unlock()
+
 	sock.unackedMtx.Lock()
-	sock.unackedFINs[packet.ackNum+1] = true
+	sock.unackedFINs[packet.seqNum+1] = true
 	sock.unackedMtx.Unlock()
 
 	n.HandleSend(sock.RemoteAddr, p, 6)
 
-	for {
-		// TODO: retransmission?
-		receivedAck := <-sock.finChan
-		if receivedAck == packet.ackNum+1 {
-			return nil
+	// wait for ACK
+	go func() {
+		for {
+			receivedAck := <-sock.finChan
+			if receivedAck == packet.seqNum+1 {
+				sock.unackedMtx.Lock()
+				delete(sock.unackedFINs, receivedAck)
+				sock.unackedMtx.Unlock()
+				if sock.state == FIN_WAIT_1 {
+					sock.state = FIN_WAIT_2
+				} else if sock.state == LAST_ACK {
+					t.deleteTCB(sock)
+				}
+				return
+			}
 		}
-	}
-	return errors.New("socket termination failed")
+	}()
 }
 
-func (sock *ListenSocket) VClose(n *node.Node) error {
-	panic("todo")
+func (sock *ListenSocket) VClose(n *node.Node, t *TCPStack) {
+	t.deleteTCB(sock)
+}
+
+func (sock *NormalSocket) getSID() uint16 { return sock.SID }
+func (sock *ListenSocket) getSID() uint16 { return sock.SID }
+
+func (t *TCPStack) deleteTCB(sock Socket) {
+	sk := t.SID_to_sk[sock.getSID()]
+	t.socketTableMtx.Lock()
+	delete(t.SocketTable, sk)
+	t.socketTableMtx.Unlock()
+	delete(t.SID_to_sk, sock.getSID())
 }
 
 func (sock *NormalSocket) printSocket() {

@@ -21,7 +21,7 @@ func listenAndAccept(port uint16, t *tcpstack.TCPStack, n *node.Node) error {
 		if err != nil {
 			return err
 		}
-		go normalSock.ReceiverThread(n)
+		go normalSock.ReceiverThread(n, t)
 		go normalSock.SenderThread(n)
 	}
 }
@@ -100,7 +100,7 @@ func REPL(n *node.Node, t *tcpstack.TCPStack) {
 					continue
 				}
 				go norm.SenderThread(n)
-				go norm.ReceiverThread(n)
+				go norm.ReceiverThread(n, t)
 			}
 		case "ls":
 			t.PrintTable()
@@ -157,7 +157,27 @@ func REPL(n *node.Node, t *tcpstack.TCPStack) {
 			socket.(*tcpstack.NormalSocket).VRead(uint16(num))
 
 		case "cl":
-			fmt.Println("to do")
+			if len(tokens) < 2 {
+				fmt.Println("cl usage: cl <socketID>")
+				continue
+			}
+			sock, err := strconv.ParseUint(tokens[1], 10, 16)
+			if err != nil {
+				fmt.Println("Could not parse socket ID as int")
+				continue
+			}
+			// check socket ID is valid
+			sk, ok := t.SID_to_sk[uint16(sock)]
+			if !ok {
+				fmt.Println("Could not find socket")
+				continue
+			}
+			socket, ok := t.SocketTable[sk]
+			if !ok {
+				fmt.Println("Could not find socket")
+				continue
+			}
+			socket.VClose(n, t)
 		case "sf":
 			fmt.Println("to do")
 		case "rf":
