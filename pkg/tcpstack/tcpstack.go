@@ -370,15 +370,11 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		earlyPQ:        make(pq.EarlyPriorityQueue, 0),
 		index:          0,
 		unackedMtx:     &sync.Mutex{},
-<<<<<<< HEAD
-		closedMtx:      &sync.Mutex{},
 		ticker:         time.NewTicker(time.Duration(RTO_MIN * float64(time.Millisecond))),
 		RTO:            RTO_MIN,
 		SRTT:           -1,
 		packetDoneChan: make(chan bool, 1),
-=======
 		stateMtx:       &sync.Mutex{},
->>>>>>> d11d3d9be73624fef36697f5474993106eeb7799
 	}
 	t.SID_to_sk[t.SID] = newSK
 	t.SID++
@@ -473,7 +469,6 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.writeBuffer.writeMtx.Unlock()
 			// sock.readBuffer.readMtx.Unlock()
 
-<<<<<<< HEAD
 			fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
 			sock.slidingWindow(packet, n) // decided to not make it a goroutine -- revisit later if performance issues
 		}
@@ -532,10 +527,7 @@ func (sock *NormalSocket) retransThread(window *Window, n *node.Node) {
 			window.winLock.Unlock()
 			sock.resetTicker()
 
-=======
 			// fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
-			go sock.slidingWindow(packet, n)
->>>>>>> d11d3d9be73624fef36697f5474993106eeb7799
 		}
 	}
 }
@@ -664,13 +656,10 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 		}
 		window.winLock.Unlock()
 	}
-<<<<<<< HEAD
 	sock.packetDoneChan <- true
 	fmt.Println("finished sending")
-=======
-	fmt.Printf("Sent %d bytes\n", payloadSize)
+	//fmt.Printf("Sent %d bytes\n", payloadSize)
 
->>>>>>> d11d3d9be73624fef36697f5474993106eeb7799
 }
 
 func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
