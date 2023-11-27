@@ -92,6 +92,13 @@ type ListenSocket struct {
 	listenChan chan node.TCPInfo
 }
 
+const (
+	RTO_MIN   = 500
+	RTO_MAX   = 5000
+	RTO_ALPHA = 0.85
+	RTO_BETA  = 1.65
+)
+
 type NormalSocket struct {
 	SID              uint16
 	readBuffer       *ReadBuffer
@@ -111,6 +118,10 @@ type NormalSocket struct {
 	closed           bool
 	closedMtx        *sync.Mutex // for if socket is closed
 	node.SocketTableKey
+	ticker         *time.Ticker
+	RTO            float64
+	SRTT           float64
+	packetDoneChan chan bool
 }
 
 type TCPPacket struct {
@@ -126,8 +137,9 @@ type TCPPacket struct {
 }
 
 type Window struct {
-	head *WindowNode
-	tail *WindowNode
+	head    *WindowNode
+	tail    *WindowNode
+	winLock *sync.Mutex
 }
 
 type WindowNode struct {
@@ -136,7 +148,8 @@ type WindowNode struct {
 	expectedAck  uint32
 	packet       *TCPPacket
 	index        uint32
-	// lastSent time.Time
+	lastSent     time.Time
+	retrans      bool
 }
 
 func Initialize(n *node.Node) *TCPStack {
@@ -217,6 +230,10 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		state:          SYN_SENT,
 		SocketTableKey: sk,
 		normalChan:     make(chan node.TCPInfo, 100),
+		ticker:         time.NewTicker(time.Duration(RTO_MIN * float64(time.Millisecond))),
+		RTO:            RTO_MIN,
+		SRTT:           -1,
+		packetDoneChan: make(chan bool, 1),
 	}
 	t.SID_to_sk[t.SID] = sk
 	t.SID++
@@ -355,6 +372,10 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		index:          0,
 		unackedMtx:     &sync.Mutex{},
 		closedMtx:      &sync.Mutex{},
+		ticker:         time.NewTicker(time.Duration(RTO_MIN * float64(time.Millisecond))),
+		RTO:            RTO_MIN,
+		SRTT:           -1,
+		packetDoneChan: make(chan bool, 1),
 	}
 	t.SID_to_sk[t.SID] = newSK
 	t.SID++
@@ -450,7 +471,63 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.readBuffer.readMtx.Unlock()
 
 			fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
-			go sock.slidingWindow(packet, n)
+			sock.slidingWindow(packet, n) // decided to not make it a goroutine -- revisit later if performance issues
+		}
+	}
+}
+
+func (sock *NormalSocket) recomputeRTO(RTT float64) {
+	fmt.Printf("curr rto: %f\n", sock.RTO)
+	if RTT < 0 {
+		// then we're indicating just expiration
+		sock.RTO = 2 * sock.RTO
+		sock.RTO = max(RTO_MIN, min(RTO_MAX, sock.RTO))
+		return
+	} else if sock.SRTT < 0 {
+		sock.SRTT = RTT
+	} else {
+		sock.SRTT = (RTO_ALPHA * sock.SRTT) + (1-RTO_ALPHA)*RTT
+	}
+	sock.RTO = max(RTO_MIN, min(RTO_MAX, RTO_BETA*sock.SRTT))
+}
+
+func (sock *NormalSocket) resetTicker() {
+	sock.ticker.Reset(time.Duration(sock.RTO * float64(time.Millisecond)))
+}
+
+func (sock *NormalSocket) retransThread(window *Window, n *node.Node) {
+	for {
+		select {
+		case <-sock.packetDoneChan:
+			return
+		case <-sock.ticker.C:
+			fmt.Println("ticker expired")
+			sock.ticker.Stop()
+			// logic
+			// send + restart timer
+			sock.recomputeRTO(-1)
+			window.winLock.Lock()
+			if window.head != nil { // nothing in window
+				// send the head
+				// if window.head.expectedAck == 0 { // edge case if we hit here before things happen
+
+				// } hopefully dont run into this
+
+				// update the packet with new ack nums + window size
+				if !window.head.lastSent.IsZero() { // this packet has actually been sent before
+					window.head.packet.ackNum = sock.readBuffer.NXT + sock.baseAck
+					window.head.packet.window = uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE)
+					p := window.head.packet.marshallTCPPacket()
+					// indicate this is a retransmission, update lastSent time
+					window.head.retrans = true
+					window.head.lastSent = time.Now()
+					n.HandleSend(sock.RemoteAddr, p, 6)
+				}
+
+			}
+			window.winLock.Unlock()
+			sock.resetTicker()
+
 		}
 	}
 }
@@ -485,14 +562,24 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	head := &WindowNode{
 		next: tail,
 	}
-	window := Window{
-		head: head,
-		tail: tail,
+	window := &Window{
+		head:    head,
+		tail:    tail,
+		winLock: &sync.Mutex{},
 	}
 
+	first := true
+	sock.ticker.Stop()
+	// reset channel
+	for len(sock.ticker.C) > 0 {
+		<-sock.ticker.C
+	}
+	go sock.retransThread(window, n)
+
 	bytesSent := 0
-	startTime := time.Now()
+	//startTime := time.Now()
 	for bytesSent < payloadSize {
+		window.winLock.Lock()
 		if window.tail.index-window.head.next.index < WINDOW_SIZE && bytesToSend > 0 { // window size of 3 for testing
 			sock.writeBuffer.NXT += uint32(bytesToSend)
 
@@ -502,7 +589,13 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 			sock.unackedMtx.Unlock()
 
 			p := window.tail.packet.marshallTCPPacket()
+			window.tail.retrans = false
+			window.tail.lastSent = time.Now()
 			n.HandleSend(sock.RemoteAddr, p, 6)
+			if first {
+				first = false
+				sock.resetTicker()
+			}
 			// fmt.Printf("Sent packet, expecting ACK: %d\n", expectedAck)
 
 			// allocate next window node
@@ -536,6 +629,8 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 			receivedAck := <-sock.ackChan
 			delete(sock.unackedNums, receivedAck)
 
+			recievedTime := time.Now()
+
 			// if we received an ACK ahead of UNA (can ignore ACKs before UNA
 			// except wrap around case!!)
 			if receivedAck > sock.writeBuffer.UNA+sock.baseSeq { // fix this
@@ -543,31 +638,25 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 				sock.writeBuffer.UNA = receivedAck - sock.baseSeq                   // same
 				// shrink window from head
 				for window.head.expectedAck < receivedAck { // think about later
+					if !window.head.retrans && !window.head.lastSent.IsZero() { // update the RTO
+						sock.resetTicker()
+						diff := recievedTime.Sub(window.head.lastSent).Milliseconds()
+						sock.recomputeRTO(float64(diff))
+					}
 					window.head = window.head.next
 				}
 				// reset timer if head of window was received; TODO: maybe
 				// window.next.head.expectedAck instead of UNA+baseseq
 				// if receivedAck == window.head.next.expectedAck {
 				if receivedAck == sock.writeBuffer.UNA+sock.baseSeq {
-					startTime = time.Now()
+					//startTime = time.Now()
 				}
 				// fmt.Printf("Received ACK: %d\n", receivedAck)
 			}
 		}
-		startTime = startTime
-		// if first segment in window hasn't been acked within RTO? (<-- need to
-		// calculate), resend entire window (Go-Back-N algo)
-		// if time.Since(startTime).Milliseconds() > 200 {
-		// 	startTime = time.Now()
-		// 	temp := window.head
-		// 	for temp != nil {
-		// 		p := temp.packet.marshallTCPPacket()
-		// 		n.HandleSend(sock.RemoteAddr, p, 6)
-		// 		// fmt.Printf("Resent packet, expecting ACK: %d\n", temp.expectedAck)
-		// 		temp = temp.next
-		// 	}
-		// }
+		window.winLock.Unlock()
 	}
+	sock.packetDoneChan <- true
 	fmt.Println("finished sending")
 }
 
@@ -576,7 +665,6 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 	ignore := 0
 	for {
 		received = <-sock.normalChan
-		fmt.Printf("packet received here\n")
 		if received.Flag&header.TCPFlagAck > 0 {
 			ignore++
 			sock.ClientWindowSize = received.WindowSize
