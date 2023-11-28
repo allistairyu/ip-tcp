@@ -41,15 +41,15 @@ const (
 	FINACK = uint8(header.TCPFlagFin | header.TCPFlagAck)
 )
 
-const WINDOW_SIZE = 1 << 16
+// const WINDOW_SIZE = 1 << 16
 
 // TESTING
-// const WINDOW_SIZE = 10
+const WINDOW_SIZE = 10
 
-const MSS = uint16(1360)
+// const MSS = uint16(1360)
 
 // TESTING
-// const MSS = uint16(4)
+const MSS = uint16(4)
 
 var stateMap = map[uint8]string{
 	LISTEN:       "LISTEN",
@@ -637,29 +637,46 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 		window.winLock.Lock()
 		// zero window probing
 		// for now just retransmit at most 10 times
-		// i := 0
-		// for bytesToSend > int(sock.ClientWindowSize) && i < 10 {
-		// 	// send first unacked byte
-		// 	sock.writeBuffer.NXT = (sock.writeBuffer.NXT + 1) % WINDOW_SIZE
-		// 	distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
-		// 	b := []byte{sock.writeBuffer.buffer[sock.writeBuffer.UNA]} // lul is this right
-		// 	packet := &TCPPacket{
-		// 		sourceIp:   sock.LocalAddr,
-		// 		destIp:     sock.RemoteAddr,
-		// 		payload:    b,
-		// 		flags:      header.TCPFlagAck,
-		// 		sourcePort: sock.LocalPort,
-		// 		destPort:   sock.RemotePort,
-		// 		seqNum:     distUNA + sock.cumWriteUNA,
-		// 		ackNum:     sock.cumReadNXT,
-		// 		window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
-		// 	}
-		// 	p := packet.marshallTCPPacket()
-		// 	n.HandleSend(sock.RemoteAddr, p, 6)
-		// 	i++
-		// 	time.Sleep(1 * time.Second)
-		// 	// wait for ack
-		// }
+		i := 0
+		for bytesToSend > int(sock.ClientWindowSize) && i < 10 {
+			fmt.Println("zwp")
+			// send first unacked byte
+			sock.writeBuffer.NXT = (sock.writeBuffer.NXT + 1) % WINDOW_SIZE
+			distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
+			b := []byte{sock.writeBuffer.buffer[sock.writeBuffer.UNA]} // lul is this right
+			packet := &TCPPacket{
+				sourceIp:   sock.LocalAddr,
+				destIp:     sock.RemoteAddr,
+				payload:    b,
+				flags:      header.TCPFlagAck,
+				sourcePort: sock.LocalPort,
+				destPort:   sock.RemotePort,
+				seqNum:     distUNA + sock.cumWriteUNA,
+				ackNum:     sock.cumReadNXT,
+				window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
+			}
+			p := packet.marshallTCPPacket()
+			expectedAck := distUNA + sock.cumWriteUNA
+			sock.unackedMtx.Lock()
+			sock.unackedNums[expectedAck] = true
+			sock.unackedMtx.Unlock()
+
+			n.HandleSend(sock.RemoteAddr, p, 6)
+
+			// wait for ack
+			timeout := time.NewTicker(1 * time.Second)
+			for {
+				select {
+				case received := <-sock.ackChan:
+					if received.AckNum == expectedAck && received.WindowSize >= MSS {
+						goto normal
+					}
+				case <-timeout.C:
+					i++
+				}
+			}
+		}
+	normal:
 		if bytesToSend > 0 && window.tail.index-window.head.next.index < WINDOW_SIZE {
 			sock.writeBuffer.NXT = (sock.writeBuffer.NXT + uint32(bytesToSend)) % WINDOW_SIZE
 			distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
