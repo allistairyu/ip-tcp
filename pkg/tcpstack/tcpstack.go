@@ -474,14 +474,11 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 		if distLBW >= distNXT { // order should always be UNA, then LBW NXT so compare distances
 			// stuff to send
 			amount_to_send := (lbw - sock.writeBuffer.NXT + 1 + WINDOW_SIZE) % WINDOW_SIZE
-			if amount_to_send == 0 {
-				amount_to_send = WINDOW_SIZE
-			}
 			// amount_to_send = min(amount_to_send, uint32(sock.ClientWindowSize))
 
 			payload := make([]byte, 0) // change
 
-			first_seg := min(WINDOW_SIZE-1-sock.writeBuffer.NXT, amount_to_send)
+			first_seg := min(WINDOW_SIZE-sock.writeBuffer.NXT, amount_to_send)
 			second_seg := amount_to_send - first_seg
 			payload = append(payload, sock.writeBuffer.buffer[sock.writeBuffer.NXT:sock.writeBuffer.NXT+first_seg]...)
 			payload = append(payload, sock.writeBuffer.buffer[:second_seg]...)
