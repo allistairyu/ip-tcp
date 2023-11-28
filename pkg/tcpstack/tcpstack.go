@@ -629,22 +629,25 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 	for len(sock.ticker.C) > 0 {
 		<-sock.ticker.C
 	}
-	go sock.retransThread(window, n, t)
+	// go sock.retransThread(window, n, t)
 
 	bytesSent := 0
 	//startTime := time.Now()
+	skip_probe := true
 	for bytesSent < payloadSize {
 		window.winLock.Lock()
 		// zero window probing
-		// for now just retransmit at most 10 times
-		i := 0
-		for bytesToSend > int(sock.ClientWindowSize) && i < 10 {
+		for !skip_probe && (sock.ClientWindowSize == 0) {
 			fmt.Println("zwp")
 			// send first unacked byte
 			sock.writeBuffer.NXT = (sock.writeBuffer.NXT + 1) % WINDOW_SIZE
 			distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
-			b := []byte{sock.writeBuffer.buffer[sock.writeBuffer.UNA]} // lul is this right
-			packet := &TCPPacket{
+			rs := []rune{'z'}
+			// b := []byte{sock.writeBuffer.buffer[sock.writeBuffer.UNA]} // lul
+			// is this right
+			b := []byte(string(rs))
+
+			asdf := &TCPPacket{
 				sourceIp:   sock.LocalAddr,
 				destIp:     sock.RemoteAddr,
 				payload:    b,
@@ -655,29 +658,31 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 				ackNum:     sock.cumReadNXT,
 				window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
 			}
-			p := packet.marshallTCPPacket()
-			expectedAck := distUNA + sock.cumWriteUNA
+			pasdf := asdf.marshallTCPPacket()
+			expectedAck := distUNA + sock.cumWriteUNA + 1
 			sock.unackedMtx.Lock()
 			sock.unackedNums[expectedAck] = true
 			sock.unackedMtx.Unlock()
 
-			n.HandleSend(sock.RemoteAddr, p, 6)
+			n.HandleSend(sock.RemoteAddr, pasdf, 6)
 
 			// wait for ack
 			timeout := time.NewTicker(1 * time.Second)
 			for {
 				select {
 				case received := <-sock.ackChan:
-					if received.AckNum == expectedAck && received.WindowSize >= MSS {
+					if received.AckNum == expectedAck && received.WindowSize > 0 {
+						sock.ClientWindowSize = received.WindowSize
 						goto normal
 					}
 				case <-timeout.C:
-					i++
+					skip_probe = true
+					break
 				}
 			}
 		}
 	normal:
-		if bytesToSend > 0 && window.tail.index-window.head.next.index < WINDOW_SIZE {
+		if (sock.ClientWindowSize > 0) && (bytesToSend > 0) && ((window.head != nil && window.head.next == nil) || window.tail.index-window.head.next.index < WINDOW_SIZE) {
 			sock.writeBuffer.NXT = (sock.writeBuffer.NXT + uint32(bytesToSend)) % WINDOW_SIZE
 			distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
 			expectedAck := distUNA + sock.cumWriteUNA
@@ -718,6 +723,9 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 				window.tail.next = nextNode
 				window.tail = window.tail.next
 			}
+		}
+		if sock.ClientWindowSize == 0 {
+			skip_probe = false
 		}
 
 		// check which packets were ACKed
@@ -763,7 +771,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 		}
 		window.winLock.Unlock()
 	}
-	sock.packetDoneChan <- true
+	// sock.packetDoneChan <- true
 	// fmt.Println("finished sending")
 	fmt.Printf("Sent %d bytes\n", payloadSize)
 
@@ -774,7 +782,6 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 	for {
 		received = <-sock.normalChan
 		if received.Flag&header.TCPFlagAck > 0 {
-			sock.ClientWindowSize = received.WindowSize
 			// TODO: ignore packets whose contents should already be acked by a
 			// previous packet with higher ack
 			// account for wrap around
@@ -785,6 +792,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 
 			// sock.writeBuffer.UNA = (received.AckNum - sock.baseSeq +
 			// WINDOW_SIZE) % WINDOW_SIZE
+			sock.ClientWindowSize = received.WindowSize
 
 			sock.unackedMtx.Lock()
 			if _, ok := sock.unackedFINs[received.AckNum]; ok {
