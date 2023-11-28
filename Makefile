@@ -3,7 +3,7 @@ all:
 	go build ./cmd/vrouter
 
 run: all
-	util/vnet_run --host vhost --router reference/vrouter r1h2-test/
+	util/vnet_run --host vhost --router reference/vrouter tests/linear-r1h2/
 
 clean:
 	rm -fv vhost vrouter

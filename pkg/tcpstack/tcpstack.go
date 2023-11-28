@@ -10,14 +10,17 @@ TODO: i think this is all that's left...
 */
 
 import (
+	"bufio"
 	"container/heap"
 	"errors"
 	"fmt"
+	"io"
 	"iptcp/pkg/iptcp_utils"
 	"iptcp/pkg/node"
 	"iptcp/pkg/pq"
 	"math/rand"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
@@ -41,7 +44,7 @@ const (
 const WINDOW_SIZE = 1 << 16
 
 // TESTING
-const MSS = uint16(1)
+const MSS = uint16(1360)
 
 var stateMap = map[uint8]string{
 	LISTEN:       "LISTEN",
@@ -469,7 +472,7 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.writeBuffer.writeMtx.Unlock()
 			// sock.readBuffer.readMtx.Unlock()
 
-			fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
+			// fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
 			sock.slidingWindow(packet, n) // decided to not make it a goroutine -- revisit later if performance issues
 		}
 	}
@@ -631,7 +634,9 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 		// check which packets were ACKed
 		for len(sock.ackChan) > 0 {
 			receivedAck := <-sock.ackChan
+			sock.unackedMtx.Lock()
 			delete(sock.unackedNums, receivedAck)
+			sock.unackedMtx.Unlock()
 
 			recievedTime := time.Now()
 
@@ -667,16 +672,16 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 		window.winLock.Unlock()
 	}
 	sock.packetDoneChan <- true
-	fmt.Println("finished sending")
+	// fmt.Println("finished sending")
+	fmt.Printf("Sent %d bytes\n", payloadSize)
+
 }
 
 func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 	var received node.TCPInfo
-	ignore := 0
 	for {
 		received = <-sock.normalChan
 		if received.Flag&header.TCPFlagAck > 0 {
-			ignore++
 			sock.ClientWindowSize = received.WindowSize
 			// TODO: ignore packets whose contents should already be acked by a
 			// previous packet with higher ack
@@ -702,11 +707,6 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 				continue
 			}
 			sock.unackedMtx.Unlock()
-
-			// SLIDING WINDOW TESTING: don't ack second packet received
-			// if ignore == 3 {
-			// 	continue
-			// }
 
 			// TODO: account for when window runs out of space
 			// update read buffer pointers
@@ -822,12 +822,12 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 	// update pointer
 	sock.writeBuffer.LBW = (sock.writeBuffer.LBW + to_write) % WINDOW_SIZE
 	// fmt.Printf("Read %d bytes: %s\n", to_write, string(toRead))
-	sock.writeBuffer.writeCond.Signal()
+	sock.writeBuffer.writeCond.Broadcast()
 	sock.writeBuffer.writeMtx.Unlock()
 	return nil
 }
 
-func (sock *NormalSocket) VRead(numbytes uint16) error {
+func (sock *NormalSocket) VRead(numbytes uint16, filename string) error {
 	sock.stateMtx.Lock()
 	if sock.state == CLOSE_WAIT || sock.state == LAST_ACK {
 		sock.stateMtx.Unlock()
@@ -858,7 +858,14 @@ func (sock *NormalSocket) VRead(numbytes uint16) error {
 	//fmt.Printf("lbr: %d, nxt: %d, first_seg: %d, buf: %s\n", sock.readBuffer.LBR, sock.readBuffer.NXT, first_seg, string(sock.readBuffer.buffer[:20]))
 	toRead := append(sock.readBuffer.buffer[sock.readBuffer.LBR+1:first_seg+1], sock.readBuffer.buffer[0:second_seg]...)
 
-	fmt.Printf("Read %d bytes: %s\n", num_read, string(toRead))
+	if filename != "" {
+		if err := os.WriteFile(filename, toRead, 0644); err != nil {
+			fmt.Println(err)
+			return err
+		}
+	} else {
+		fmt.Printf("Read %d bytes: %s\n", num_read, string(toRead))
+	}
 
 	// adjust LBR
 	sock.readBuffer.LBR = (sock.readBuffer.LBR + uint32(num_read)) % WINDOW_SIZE
@@ -930,6 +937,68 @@ func (t *TCPStack) deleteTCB(sock Socket) {
 	delete(t.SocketTable, sk)
 	t.socketTableMtx.Unlock()
 	delete(t.SID_to_sk, sock.getSID())
+}
+
+func (t *TCPStack) SendFile(file *os.File, addr netip.Addr, port uint16, n *node.Node) error {
+	// Get the file size
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	// Read the file into a byte slice
+	bs := make([]byte, stat.Size())
+	_, err = bufio.NewReader(file).Read(bs)
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	sock, err := t.VConnect(addr, port, n)
+	if err != nil {
+		return err
+	}
+	go sock.ReceiverThread(n, t)
+	go sock.SenderThread(n)
+	time.Sleep(1 * time.Second)
+	fmt.Println(len(bs))
+	err = sock.VWrite(bs)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	return nil
+}
+
+func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error {
+	lsock, err := t.VListen(port)
+	if err != nil {
+		return err
+	}
+	go func() {
+		// accept connection
+		sock, err := lsock.VAccept(t, n)
+		if err != nil {
+			return
+		} else {
+			fmt.Println("connection established")
+		}
+		go sock.ReceiverThread(n, t)
+		go sock.SenderThread(n)
+
+		// receive logic
+		for {
+			sock.stateMtx.Lock()
+			if sock.state == CLOSE_WAIT {
+				break
+			}
+			sock.stateMtx.Unlock()
+			err := sock.VRead(uint16(1<<16-1), filename)
+			if err != nil {
+				fmt.Println(err)
+			}
+		}
+	}()
+	return nil
 }
 
 func (sock *NormalSocket) printSocket() {

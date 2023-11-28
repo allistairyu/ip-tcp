@@ -87,17 +87,17 @@ func REPL(n *node.Node, t *tcpstack.TCPStack) {
 				port, err := strconv.ParseUint(tokens[2], 10, 16)
 				if err != nil {
 					fmt.Println("Could not parse port as int")
-					continue
+					goto prompt
 				}
 				addr := netip.MustParseAddr(tokens[1])
 				if err != nil {
 					fmt.Println("Could not parse address")
-					continue
+					goto prompt
 				}
 				norm, err := t.VConnect(addr, uint16(port), n)
 				if err != nil {
 					fmt.Printf("Error: %s\n", err)
-					continue
+					goto prompt
 				}
 				go norm.SenderThread(n)
 				go norm.ReceiverThread(n, t)
@@ -107,84 +107,117 @@ func REPL(n *node.Node, t *tcpstack.TCPStack) {
 		case "s":
 			if len(tokens) < 3 {
 				fmt.Println("s usage: s <socketID> <bytes>")
-				continue
+				goto prompt
 			}
 			sock, err := strconv.ParseUint(tokens[1], 10, 16)
 			if err != nil {
-				fmt.Println("Could not parse socket ID as int")
-				continue
+				fmt.Println("could not parse socket ID as int")
+				goto prompt
 			}
 			// check socket ID is valid
 			sk, ok := t.SID_to_sk[uint16(sock)]
 			if !ok {
 				fmt.Println("Could not find socket")
-				continue
+				goto prompt
 			}
 			socket, ok := t.SocketTable[sk]
 			if !ok {
 				fmt.Println("Could not find socket")
-				continue
+				goto prompt
 			}
 			message := strings.Join(tokens[2:], " ")
 			socket.(*tcpstack.NormalSocket).VWrite([]byte(message))
 		case "r":
 			if len(tokens) != 3 {
 				fmt.Println("r usage: r <socket ID> <numbytes>")
-				continue
+				goto prompt
 			}
 			sock, err := strconv.ParseUint(tokens[1], 10, 16)
 			if err != nil {
 				fmt.Println("Could not parse socket ID as int")
-				continue
+				goto prompt
 			}
 			num, err := strconv.ParseUint(tokens[2], 10, 16)
 			if err != nil {
 				fmt.Println("Could not parse numbytes as int")
-				continue
+				goto prompt
 			}
 			// check socket ID is valid
 			sk, ok := t.SID_to_sk[uint16(sock)]
 			if !ok {
 				fmt.Println("Could not find socket")
-				continue
+				goto prompt
 			}
 
 			socket, ok := t.SocketTable[sk]
 			if !ok {
 				fmt.Println("Could not find socket")
-				continue
+				goto prompt
 			}
-			socket.(*tcpstack.NormalSocket).VRead(uint16(num))
+			socket.(*tcpstack.NormalSocket).VRead(uint16(num), "")
 
 		case "cl":
 			if len(tokens) < 2 {
 				fmt.Println("cl usage: cl <socketID>")
-				continue
+				goto prompt
 			}
 			sock, err := strconv.ParseUint(tokens[1], 10, 16)
 			if err != nil {
 				fmt.Println("Could not parse socket ID as int")
-				continue
+				goto prompt
 			}
 			// check socket ID is valid
 			sk, ok := t.SID_to_sk[uint16(sock)]
 			if !ok {
 				fmt.Println("Could not find socket")
-				continue
+				goto prompt
 			}
 			socket, ok := t.SocketTable[sk]
 			if !ok {
 				fmt.Println("Could not find socket")
-				continue
+				goto prompt
 			}
 			socket.VClose(n, t)
 		case "sf":
-			fmt.Println("to do")
+			if len(tokens) < 3 {
+				fmt.Println("sf usage: sf <filename> <vip> <port>")
+				goto prompt
+			}
+			file, err := os.Open(tokens[1])
+			if err != nil {
+				fmt.Println(err)
+				goto prompt
+			}
+			port, err := strconv.ParseUint(tokens[3], 10, 16)
+			if err != nil {
+				fmt.Println("Could not parse port as int")
+				goto prompt
+			}
+			addr := netip.MustParseAddr(tokens[2])
+			if err != nil {
+				fmt.Println("Could not parse address")
+				goto prompt
+			}
+			err = t.SendFile(file, addr, uint16(port), n)
+			file.Close()
+			if err != nil {
+				fmt.Println(err)
+			}
 		case "rf":
-			fmt.Println("to do")
+			if len(tokens) < 3 {
+				fmt.Println("rf usage: rf <filename> <port>")
+				goto prompt
+			}
+			port, err := strconv.ParseUint(tokens[2], 10, 16)
+			if err != nil {
+				fmt.Println("Could not parse port as int")
+				goto prompt
+			}
+			t.ReceiveFile(tokens[1], uint16(port), n)
 		default:
 
 		}
+	prompt:
 		fmt.Print("> ")
 	}
 }
