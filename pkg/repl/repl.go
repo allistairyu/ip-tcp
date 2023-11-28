@@ -154,7 +154,7 @@ func REPL(n *node.Node, t *tcpstack.TCPStack) {
 				fmt.Println("Could not find socket")
 				goto prompt
 			}
-			socket.(*tcpstack.NormalSocket).VRead(uint16(num), "")
+			socket.(*tcpstack.NormalSocket).VRead(uint16(num), nil)
 
 		case "cl":
 			if len(tokens) < 2 {

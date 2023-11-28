@@ -802,32 +802,43 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 		return errors.New("sock closed")
 	}
 	sock.stateMtx.Unlock()
+	bytesSent := uint32(0)
+	for bytesSent < uint32(len(message)) {
+		// first get how much left to write: this is LBW to UNA (so writing from LBW
+		// + 1 to UNA - 1)
+		sock.writeBuffer.writeMtx.Lock()
+		// var space uint32
+		// if sock.writeBuffer.UNA > sock.writeBuffer.LBW {
+		// 	space = sock.writeBuffer.UNA - sock.writeBuffer.LBW
+		// } else {
+		// 	space = WINDOW_SIZE - sock.writeBuffer.LBW + sock.writeBuffer.UNA
+		// }
+		// fmt.Println(space)
+		space := (sock.writeBuffer.UNA - 1 - sock.writeBuffer.LBW + WINDOW_SIZE) % WINDOW_SIZE
+		if space == 0 {
+			space = WINDOW_SIZE
+		}
+		to_write := min(uint32(len(message))-bytesSent, space, uint32(node.MaxMessageSize-40)) // max is maxmsg - ip header - tcp header
 
-	// first get how much left to write: this is LBW to UNA (so writing from LBW
-	// + 1 to UNA - 1)
-	sock.writeBuffer.writeMtx.Lock()
-	space := (sock.writeBuffer.UNA - 1 - sock.writeBuffer.LBW + WINDOW_SIZE) % WINDOW_SIZE
-	if space == 0 {
-		space = WINDOW_SIZE
+		first_seg := min(WINDOW_SIZE-sock.writeBuffer.LBW-1, to_write)
+		second_seg := to_write - first_seg
+
+		fmt.Println(message[bytesSent : bytesSent+first_seg])
+		copy(sock.writeBuffer.buffer[sock.writeBuffer.LBW+1:sock.writeBuffer.LBW+1+first_seg], message[bytesSent:bytesSent+first_seg])
+		copy(sock.writeBuffer.buffer[:second_seg], message[bytesSent+first_seg:bytesSent+first_seg+second_seg])
+
+		bytesSent += to_write
+
+		// update pointer
+		sock.writeBuffer.LBW = (sock.writeBuffer.LBW + to_write) % WINDOW_SIZE
+		// fmt.Printf("Read %d bytes: %s\n", to_write, string(toRead))
+		sock.writeBuffer.writeCond.Signal()
+		sock.writeBuffer.writeMtx.Unlock()
 	}
-	to_write := min(uint32(len(message)), space)
-	to_write = min(to_write, uint32(node.MaxMessageSize-40)) // max is maxmsg - ip header - tcp header
-
-	first_seg := min(WINDOW_SIZE-sock.writeBuffer.LBW-1, to_write)
-	second_seg := to_write - first_seg
-
-	copy(sock.writeBuffer.buffer[sock.writeBuffer.LBW+1:sock.writeBuffer.LBW+1+first_seg], message[:first_seg])
-	copy(sock.writeBuffer.buffer[:second_seg], message[first_seg:first_seg+second_seg])
-
-	// update pointer
-	sock.writeBuffer.LBW = (sock.writeBuffer.LBW + to_write) % WINDOW_SIZE
-	// fmt.Printf("Read %d bytes: %s\n", to_write, string(toRead))
-	sock.writeBuffer.writeCond.Broadcast()
-	sock.writeBuffer.writeMtx.Unlock()
 	return nil
 }
 
-func (sock *NormalSocket) VRead(numbytes uint16, filename string) error {
+func (sock *NormalSocket) VRead(numbytes uint16, file *os.File) error {
 	sock.stateMtx.Lock()
 	if sock.state == CLOSE_WAIT || sock.state == LAST_ACK {
 		sock.stateMtx.Unlock()
@@ -858,10 +869,12 @@ func (sock *NormalSocket) VRead(numbytes uint16, filename string) error {
 	//fmt.Printf("lbr: %d, nxt: %d, first_seg: %d, buf: %s\n", sock.readBuffer.LBR, sock.readBuffer.NXT, first_seg, string(sock.readBuffer.buffer[:20]))
 	toRead := append(sock.readBuffer.buffer[sock.readBuffer.LBR+1:first_seg+1], sock.readBuffer.buffer[0:second_seg]...)
 
-	if filename != "" {
-		if err := os.WriteFile(filename, toRead, 0644); err != nil {
+	if file != nil {
+		if _, err := file.Write(toRead); err != nil {
 			fmt.Println(err)
 			return err
+		} else {
+			fmt.Println(toRead)
 		}
 	} else {
 		fmt.Printf("Read %d bytes: %s\n", num_read, string(toRead))
@@ -982,6 +995,11 @@ func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error
 		} else {
 			fmt.Println("connection established")
 		}
+		file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 		go sock.ReceiverThread(n, t)
 		go sock.SenderThread(n)
 
@@ -992,7 +1010,7 @@ func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error
 				break
 			}
 			sock.stateMtx.Unlock()
-			err := sock.VRead(uint16(1<<16-1), filename)
+			err := sock.VRead(uint16(1<<16-1), file)
 			if err != nil {
 				fmt.Println(err)
 			}
