@@ -22,7 +22,7 @@ func listenAndAccept(port uint16, t *tcpstack.TCPStack, n *node.Node) error {
 			return err
 		}
 		go normalSock.ReceiverThread(n, t)
-		go normalSock.SenderThread(n)
+		go normalSock.SenderThread(n, t)
 	}
 }
 
@@ -99,7 +99,7 @@ func REPL(n *node.Node, t *tcpstack.TCPStack) {
 					fmt.Printf("Error: %s\n", err)
 					goto prompt
 				}
-				go norm.SenderThread(n)
+				go norm.SenderThread(n, t)
 				go norm.ReceiverThread(n, t)
 			}
 		case "ls":

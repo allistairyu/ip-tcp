@@ -461,7 +461,7 @@ func (p TCPPacket) marshallTCPPacket() []byte {
 	return ipPacketPayload
 }
 
-func (sock *NormalSocket) SenderThread(n *node.Node) {
+func (sock *NormalSocket) SenderThread(n *node.Node, t *TCPStack) {
 	// sock.writeBuffer.writeMtx.Lock()
 	// defer sock.writeBuffer.writeMtx.Unlock()
 	for {
@@ -502,7 +502,7 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.readBuffer.readMtx.Unlock()
 
 			// fmt.Printf("sending %d bytes: %s\n", amount_to_send, string(payload))
-			sock.slidingWindow(packet, n) // decided to not make it a goroutine -- revisit later if performance issues
+			sock.slidingWindow(packet, n, t) // decided to not make it a goroutine -- revisit later if performance issues
 		}
 	}
 }
@@ -525,7 +525,9 @@ func (sock *NormalSocket) resetTicker() {
 	sock.ticker.Reset(time.Duration(sock.RTO * float64(time.Millisecond)))
 }
 
-func (sock *NormalSocket) retransThread(window *Window, n *node.Node) {
+func (sock *NormalSocket) retransThread(window *Window, n *node.Node, t *TCPStack) {
+	last_index := -1
+	cnt := 0
 	for {
 		select {
 		case <-sock.packetDoneChan:
@@ -549,7 +551,20 @@ func (sock *NormalSocket) retransThread(window *Window, n *node.Node) {
 					// indicate this is a retransmission, update lastSent time
 					win_node.retrans = true
 					win_node.lastSent = time.Now()
-					n.HandleSend(sock.RemoteAddr, p, 6)
+					if uint32(last_index) == win_node.index {
+						cnt += 1
+					} else {
+						cnt = 1
+						last_index = int(win_node.index)
+					}
+					if cnt == 10 {
+						// terminate
+						fmt.Println("Retransmission failed after 10 times; closing connection.")
+						defer sock.VClose(n, t)
+						return
+					} else {
+						n.HandleSend(sock.RemoteAddr, p, 6)
+					}
 				}
 			} else if window.head.next != nil {
 				win_node := window.head.next
@@ -569,7 +584,7 @@ func (sock *NormalSocket) retransThread(window *Window, n *node.Node) {
 	}
 }
 
-func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
+func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPStack) {
 	// for testing purposes, split total payload into segments of size 1
 	// should eventually be MSS (max ip packet size - ip header - tcp header)
 	// sock.writeBuffer.writeMtx.Lock()
@@ -614,7 +629,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	for len(sock.ticker.C) > 0 {
 		<-sock.ticker.C
 	}
-	go sock.retransThread(window, n)
+	go sock.retransThread(window, n, t)
 
 	bytesSent := 0
 	//startTime := time.Now()
@@ -1054,7 +1069,7 @@ func (t *TCPStack) SendFile(file *os.File, addr netip.Addr, port uint16, n *node
 		return err
 	}
 	go sock.ReceiverThread(n, t)
-	go sock.SenderThread(n)
+	go sock.SenderThread(n, t)
 	time.Sleep(1 * time.Second)
 	fmt.Println(len(bs))
 	err = sock.VWrite(bs)
@@ -1084,7 +1099,7 @@ func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error
 			return
 		}
 		go sock.ReceiverThread(n, t)
-		go sock.SenderThread(n)
+		go sock.SenderThread(n, t)
 
 		// receive logic
 		for {
