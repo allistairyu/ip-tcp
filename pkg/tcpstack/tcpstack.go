@@ -41,13 +41,15 @@ const (
 	FINACK = uint8(header.TCPFlagFin | header.TCPFlagAck)
 )
 
-// const WINDOW_SIZE = 1 << 16
-// TESTING
-const WINDOW_SIZE = 10
+const WINDOW_SIZE = 1 << 16
 
-// const MSS = uint16(1360)
 // TESTING
-const MSS = uint16(4)
+// const WINDOW_SIZE = 10
+
+const MSS = uint16(1360)
+
+// TESTING
+// const MSS = uint16(4)
 
 var stateMap = map[uint8]string{
 	LISTEN:       "LISTEN",
@@ -304,7 +306,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		UNA:       1,
 		NXT:       1,
 		LBW:       0,
-		writeChan: make(chan uint32, 50),
+		writeChan: make(chan uint32),
 	}
 	newSocket.readBuffer = new_read
 	newSocket.writeBuffer = new_send
@@ -367,7 +369,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		UNA:       1,
 		NXT:       1,
 		LBW:       0,
-		writeChan: make(chan uint32, 50),
+		writeChan: make(chan uint32),
 	}
 	// create new normal socket
 	newSK := flipSocketKeyFields(sk)
@@ -499,7 +501,7 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.writeBuffer.writeMtx.Unlock()
 			// sock.readBuffer.readMtx.Unlock()
 
-			fmt.Printf("sending %d bytes: %s\n", amount_to_send, string(payload))
+			// fmt.Printf("sending %d bytes: %s\n", amount_to_send, string(payload))
 			sock.slidingWindow(packet, n) // decided to not make it a goroutine -- revisit later if performance issues
 		}
 	}
@@ -612,7 +614,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	for len(sock.ticker.C) > 0 {
 		<-sock.ticker.C
 	}
-	// go sock.retransThread(window, n)
+	go sock.retransThread(window, n)
 
 	bytesSent := 0
 	//startTime := time.Now()
@@ -883,7 +885,7 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 	for bytesSent < uint32(len(message)) {
 		// first get how much left to write: this is LBW to UNA (so writing from LBW
 		// + 1 to UNA - 1)
-		sock.writeBuffer.writeMtx.Lock()
+		// sock.writeBuffer.writeMtx.Lock()
 		// var space uint32
 		// if sock.writeBuffer.UNA > sock.writeBuffer.LBW {
 		// 	space = sock.writeBuffer.UNA - sock.writeBuffer.LBW
@@ -901,7 +903,7 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 		first_seg := min(WINDOW_SIZE-sock.writeBuffer.LBW-1, to_write)
 		second_seg := to_write - first_seg
 
-		fmt.Println(string(message[bytesSent : bytesSent+first_seg]))
+		// fmt.Println(string(message[bytesSent : bytesSent+first_seg]))
 		copy(sock.writeBuffer.buffer[sock.writeBuffer.LBW+1:sock.writeBuffer.LBW+1+first_seg], message[bytesSent:bytesSent+first_seg])
 		copy(sock.writeBuffer.buffer[:second_seg], message[bytesSent+first_seg:bytesSent+first_seg+second_seg])
 
@@ -912,7 +914,8 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 		// fmt.Printf("Read %d bytes: %s\n", to_write, string(toRead))
 		// sock.writeBuffer.writeCond.Signal()
 		sock.writeBuffer.writeChan <- sock.writeBuffer.LBW
-		sock.writeBuffer.writeMtx.Unlock()
+		// sock.writeBuffer.writeMtx.Unlock()
+		fmt.Println(bytesSent)
 	}
 	return nil
 }
@@ -952,9 +955,10 @@ func (sock *NormalSocket) VRead(numbytes uint16, file *os.File) error {
 		if _, err := file.Write(toRead); err != nil {
 			fmt.Println(err)
 			return err
-		} else {
-			fmt.Println(toRead)
 		}
+		// } else {
+		// 	fmt.Println(toRead)
+		// }
 	} else {
 		fmt.Printf("Read %d bytes: %s\n", num_read, string(toRead))
 	}
