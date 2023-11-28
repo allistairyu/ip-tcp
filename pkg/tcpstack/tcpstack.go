@@ -41,10 +41,13 @@ const (
 	FINACK = uint8(header.TCPFlagFin | header.TCPFlagAck)
 )
 
-const WINDOW_SIZE = 1 << 16
-
+// const WINDOW_SIZE = 1 << 16
 // TESTING
-const MSS = uint16(1360)
+const WINDOW_SIZE = 10
+
+// const MSS = uint16(1360)
+// TESTING
+const MSS = uint16(4)
 
 var stateMap = map[uint8]string{
 	LISTEN:       "LISTEN",
@@ -81,6 +84,7 @@ type WriteBuffer struct {
 	UNA       uint32
 	NXT       uint32
 	LBW       uint32
+	writeChan chan uint32
 }
 
 type Socket interface {
@@ -112,7 +116,7 @@ type NormalSocket struct {
 	baseSeq          uint32
 	baseAck          uint32
 	ClientWindowSize uint16
-	ackChan          chan uint32
+	ackChan          chan node.TCPInfo
 	finChan          chan uint32
 	unackedNums      map[uint32]bool
 	unackedFINs      map[uint32]bool
@@ -126,6 +130,7 @@ type NormalSocket struct {
 	packetDoneChan chan bool
 	cumWriteUNA    uint32
 	cumReadNXT     uint32
+	notFirstWrite  bool
 }
 
 type TCPPacket struct {
@@ -255,7 +260,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		destPort:   destPort,
 		seqNum:     seqNum,
 		ackNum:     0,
-		window:     65535,
+		window:     WINDOW_SIZE - 1,
 	}
 	packet := tcpPacket.marshallTCPPacket()
 	i := 0
@@ -299,14 +304,15 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		UNA:       1,
 		NXT:       1,
 		LBW:       0,
+		writeChan: make(chan uint32, 50),
 	}
 	newSocket.readBuffer = new_read
 	newSocket.writeBuffer = new_send
 	newSocket.baseAck = ci.SeqNum
 	newSocket.baseSeq = ci.AckNum - 1
-	newSocket.ClientWindowSize = 65535
+	newSocket.ClientWindowSize = WINDOW_SIZE - 1
 	// newSocket.chans = make(map[uint32]chan bool)
-	newSocket.ackChan = make(chan uint32, 100) // is 100 the right size
+	newSocket.ackChan = make(chan node.TCPInfo, 100) // is 100 the right size
 	newSocket.finChan = make(chan uint32)
 	newSocket.unackedNums = make(map[uint32]bool)
 	newSocket.earlyPQ = make(pq.EarlyPriorityQueue, 0)
@@ -325,13 +331,14 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 		destPort:   destPort,
 		seqNum:     ci.AckNum,
 		ackNum:     ci.SeqNum + 1,
-		window:     65535,
+		window:     WINDOW_SIZE - 1,
 	}
 	packet = tcpPacket.marshallTCPPacket()
 	// establish connection
 	n.HandleSend(destAddr, packet, 6)
 	newSocket.cumReadNXT = ci.SeqNum + 1
 	newSocket.cumWriteUNA = ci.AckNum
+	newSocket.ClientWindowSize = ci.WindowSize
 
 	return newSocket, nil
 }
@@ -360,6 +367,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		UNA:       1,
 		NXT:       1,
 		LBW:       0,
+		writeChan: make(chan uint32, 50),
 	}
 	// create new normal socket
 	newSK := flipSocketKeyFields(sk)
@@ -370,7 +378,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		state:          SYN_RECEIVED,
 		SocketTableKey: newSK,
 		normalChan:     make(chan node.TCPInfo, 100),
-		ackChan:        make(chan uint32, 100),
+		ackChan:        make(chan node.TCPInfo, 100),
 		finChan:        make(chan uint32),
 		unackedNums:    make(map[uint32]bool),
 		unackedFINs:    make(map[uint32]bool),
@@ -389,7 +397,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 
 	newSocket.baseAck = ci.SeqNum
 	// newSocket.baseSeq = rand.Uint32()
-	newSocket.ClientWindowSize = 65535
+	newSocket.ClientWindowSize = WINDOW_SIZE - 1
 	// TESTING
 	newSocket.baseSeq = uint32(6000)
 
@@ -403,7 +411,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		destPort:   sk.LocalPort,
 		seqNum:     newSocket.baseSeq,
 		ackNum:     ci.SeqNum + 1,
-		window:     65535,
+		window:     WINDOW_SIZE - 1,
 	}
 	packet := tcpPacket.marshallTCPPacket()
 
@@ -416,6 +424,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		ci = <-lsock.listenChan
 	}
 	newSocket.state = ESTABLISHED
+	newSocket.ClientWindowSize = ci.WindowSize
 
 	return newSocket, nil
 }
@@ -451,24 +460,32 @@ func (p TCPPacket) marshallTCPPacket() []byte {
 }
 
 func (sock *NormalSocket) SenderThread(n *node.Node) {
-	sock.writeBuffer.writeMtx.Lock()
-	defer sock.writeBuffer.writeMtx.Unlock()
+	// sock.writeBuffer.writeMtx.Lock()
+	// defer sock.writeBuffer.writeMtx.Unlock()
 	for {
 		// wait for LBW/NXT fields to be updated by VWrite
-		sock.writeBuffer.writeCond.Wait()
-		distLBW := (sock.writeBuffer.LBW - sock.writeBuffer.UNA) % WINDOW_SIZE
+		// sock.writeBuffer.writeCond.Wait()
+		lbw := <-sock.writeBuffer.writeChan
+
+		// distLBW := (sock.writeBuffer.LBW - sock.writeBuffer.UNA) %
+		// WINDOW_SIZE
+		distLBW := (lbw - sock.writeBuffer.UNA) % WINDOW_SIZE
 		distNXT := (sock.writeBuffer.NXT - sock.writeBuffer.UNA) % WINDOW_SIZE
 		if distLBW >= distNXT { // order should always be UNA, then LBW NXT so compare distances
 			// stuff to send
-			amount_to_send := (sock.writeBuffer.LBW - sock.writeBuffer.NXT + 1 + WINDOW_SIZE) % WINDOW_SIZE
-			amount_to_send = min(amount_to_send, uint32(sock.ClientWindowSize))
+			amount_to_send := (lbw - sock.writeBuffer.NXT + 1 + WINDOW_SIZE) % WINDOW_SIZE
+			if amount_to_send == 0 {
+				amount_to_send = WINDOW_SIZE
+			}
+			// amount_to_send = min(amount_to_send, uint32(sock.ClientWindowSize))
 
 			payload := make([]byte, 0) // change
-			for amount_to_send > 0 {
-				to_add := min(WINDOW_SIZE-1-sock.writeBuffer.NXT, amount_to_send)
-				amount_to_send -= to_add
-				payload = append(payload, sock.writeBuffer.buffer[sock.writeBuffer.NXT:sock.writeBuffer.NXT+to_add]...)
-			}
+
+			first_seg := min(WINDOW_SIZE-1-sock.writeBuffer.NXT, amount_to_send)
+			second_seg := amount_to_send - first_seg
+			payload = append(payload, sock.writeBuffer.buffer[sock.writeBuffer.NXT:sock.writeBuffer.NXT+first_seg]...)
+			payload = append(payload, sock.writeBuffer.buffer[:second_seg]...)
+
 			// sock.writeBuffer.writeMtx.Lock()
 			// sock.readBuffer.readMtx.Lock()
 			packet := TCPPacket{
@@ -485,7 +502,7 @@ func (sock *NormalSocket) SenderThread(n *node.Node) {
 			// sock.writeBuffer.writeMtx.Unlock()
 			// sock.readBuffer.readMtx.Unlock()
 
-			// fmt.Printf("Sent %d bytes: %s\n", amount_to_send, string(payload))
+			fmt.Printf("sending %d bytes: %s\n", amount_to_send, string(payload))
 			sock.slidingWindow(packet, n) // decided to not make it a goroutine -- revisit later if performance issues
 		}
 	}
@@ -598,13 +615,38 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 	for len(sock.ticker.C) > 0 {
 		<-sock.ticker.C
 	}
-	go sock.retransThread(window, n)
+	// go sock.retransThread(window, n)
 
 	bytesSent := 0
 	//startTime := time.Now()
 	for bytesSent < payloadSize {
 		window.winLock.Lock()
-		if bytesToSend > 0 && window.tail.index-window.head.next.index < WINDOW_SIZE { // window size of 3 for testing
+		// zero window probing
+		// for now just retransmit at most 10 times
+		// i := 0
+		// for bytesToSend > int(sock.ClientWindowSize) && i < 10 {
+		// 	// send first unacked byte
+		// 	sock.writeBuffer.NXT = (sock.writeBuffer.NXT + 1) % WINDOW_SIZE
+		// 	distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
+		// 	b := []byte{sock.writeBuffer.buffer[sock.writeBuffer.UNA]} // lul is this right
+		// 	packet := &TCPPacket{
+		// 		sourceIp:   sock.LocalAddr,
+		// 		destIp:     sock.RemoteAddr,
+		// 		payload:    b,
+		// 		flags:      header.TCPFlagAck,
+		// 		sourcePort: sock.LocalPort,
+		// 		destPort:   sock.RemotePort,
+		// 		seqNum:     distUNA + sock.cumWriteUNA,
+		// 		ackNum:     sock.cumReadNXT,
+		// 		window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
+		// 	}
+		// 	p := packet.marshallTCPPacket()
+		// 	n.HandleSend(sock.RemoteAddr, p, 6)
+		// 	i++
+		// 	time.Sleep(1 * time.Second)
+		// 	// wait for ack
+		// }
+		if bytesToSend > 0 && window.tail.index-window.head.next.index < WINDOW_SIZE {
 			sock.writeBuffer.NXT = (sock.writeBuffer.NXT + uint32(bytesToSend)) % WINDOW_SIZE
 			distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
 			expectedAck := distUNA + sock.cumWriteUNA
@@ -649,10 +691,13 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node) {
 
 		// check which packets were ACKed
 		for len(sock.ackChan) > 0 {
-			receivedAck := <-sock.ackChan
+			received := <-sock.ackChan
+			receivedAck := received.AckNum
 			sock.unackedMtx.Lock()
 			delete(sock.unackedNums, receivedAck)
 			sock.unackedMtx.Unlock()
+
+			sock.ClientWindowSize = received.WindowSize
 
 			recievedTime := time.Now()
 
@@ -718,7 +763,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 			}
 			// here we received an ack packet in response to what we sent
 			if _, ok := sock.unackedNums[received.AckNum]; ok { // TODO: possible that this received ACK num is in map but not an ACK in response to what we sent
-				sock.ackChan <- received.AckNum
+				sock.ackChan <- received
 				sock.unackedMtx.Unlock()
 				continue
 			}
@@ -823,6 +868,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 				ackNum:     sock.cumReadNXT,
 				window:     uint16(new_window),
 			}
+			// TODO: do i need to update clientwindowsize here?
 			packet := tcpPacket.marshallTCPPacket()
 			n.HandleSend(sk.LocalAddr, packet, 6)
 		}
@@ -849,15 +895,16 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 		// }
 		// fmt.Println(space)
 		space := (sock.writeBuffer.UNA - 1 - sock.writeBuffer.LBW + WINDOW_SIZE) % WINDOW_SIZE
-		if space == 0 {
-			space = WINDOW_SIZE
+		if !sock.notFirstWrite {
+			space = WINDOW_SIZE - 1
+			sock.notFirstWrite = true
 		}
 		to_write := min(uint32(len(message))-bytesSent, space, uint32(node.MaxMessageSize-40)) // max is maxmsg - ip header - tcp header
 
 		first_seg := min(WINDOW_SIZE-sock.writeBuffer.LBW-1, to_write)
 		second_seg := to_write - first_seg
 
-		fmt.Println(message[bytesSent : bytesSent+first_seg])
+		fmt.Println(string(message[bytesSent : bytesSent+first_seg]))
 		copy(sock.writeBuffer.buffer[sock.writeBuffer.LBW+1:sock.writeBuffer.LBW+1+first_seg], message[bytesSent:bytesSent+first_seg])
 		copy(sock.writeBuffer.buffer[:second_seg], message[bytesSent+first_seg:bytesSent+first_seg+second_seg])
 
@@ -866,7 +913,8 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 		// update pointer
 		sock.writeBuffer.LBW = (sock.writeBuffer.LBW + to_write) % WINDOW_SIZE
 		// fmt.Printf("Read %d bytes: %s\n", to_write, string(toRead))
-		sock.writeBuffer.writeCond.Signal()
+		// sock.writeBuffer.writeCond.Signal()
+		sock.writeBuffer.writeChan <- sock.writeBuffer.LBW
 		sock.writeBuffer.writeMtx.Unlock()
 	}
 	return nil
