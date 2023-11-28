@@ -179,7 +179,7 @@ func REPL(n *node.Node, t *tcpstack.TCPStack) {
 			}
 			socket.VClose(n, t)
 		case "sf":
-			if len(tokens) < 3 {
+			if len(tokens) < 4 {
 				fmt.Println("sf usage: sf <filename> <vip> <port>")
 				goto prompt
 			}
