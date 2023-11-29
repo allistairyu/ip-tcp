@@ -827,15 +827,19 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 
 			if received.Flag&header.TCPFlagFin > 0 {
 				sock.cumReadNXT += 1
+				sock.stateMtx.Lock()
 				if sock.state == ESTABLISHED {
 					sock.state = CLOSE_WAIT
+					sock.stateMtx.Unlock()
 				} else if sock.state == FIN_WAIT_2 {
 					sock.state = TIME_WAIT
+					sock.stateMtx.Unlock()
 					go func(t *TCPStack, sock *NormalSocket) {
 						time.Sleep(120 * time.Second)
 						t.deleteTCB(sock)
 					}(t, sock)
 				}
+				// sock.stateMtx.Unlock()
 			} else if ((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE) != 0 {
 				// insert packet payload into read buffer if NOT FULL
 				// check size... full if next to be written into is not read yet, so NXT + 1 == LBR
@@ -864,15 +868,20 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 					earlyPacket := heap.Pop(&sock.earlyPQ).(*pq.EarlyPacket)
 					// check if this is FIN
 					if earlyPacket.Flags&header.TCPFlagFin > 0 {
+						sock.stateMtx.Lock()
 						if sock.state == ESTABLISHED {
 							sock.state = CLOSE_WAIT
+							sock.stateMtx.Unlock()
 						} else if sock.state == FIN_WAIT_2 {
 							sock.state = TIME_WAIT
+							sock.stateMtx.Unlock()
 							go func(t *TCPStack, sock *NormalSocket) {
 								time.Sleep(120 * time.Second)
 								t.deleteTCB(sock)
 							}(t, sock)
 						}
+						// sock.stateMtx.Unlock()
+
 					} else {
 						to_add := uint32(len(earlyPacket.Payload))
 						sock.cumReadNXT = earlyPacket.Priority + uint32(len(earlyPacket.Payload))
@@ -920,12 +929,11 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 	}
 	sock.stateMtx.Unlock()
 	bytesSent := uint32(0)
-	notFirstWrite := false
 	for bytesSent < uint32(len(message)) {
 		space := (sock.writeBuffer.UNA - 1 - sock.writeBuffer.LBW + WINDOW_SIZE) % WINDOW_SIZE
-		if !notFirstWrite {
+		if !sock.notFirstWrite {
 			space = WINDOW_SIZE - 1
-			notFirstWrite = true
+			sock.notFirstWrite = true
 		}
 		to_write := min(uint32(len(message))-bytesSent, space, uint32(node.MaxMessageSize-40)) // max is maxmsg - ip header - tcp header
 
@@ -990,6 +998,14 @@ func (sock *NormalSocket) VRead(numbytes uint16, file *os.File) error {
 
 func (sock *NormalSocket) VClose(n *node.Node, t *TCPStack) error {
 	// send FIN/ACK
+	distUNA := (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
+	seq := distUNA + sock.cumWriteUNA
+	ack := sock.cumReadNXT
+	if !sock.notFirstWrite {
+		sock.readBuffer.NXT++
+		seq++
+		sock.notFirstWrite = true
+	}
 	packet := TCPPacket{
 		sourceIp:   sock.LocalAddr,
 		destIp:     sock.RemoteAddr,
@@ -997,8 +1013,8 @@ func (sock *NormalSocket) VClose(n *node.Node, t *TCPStack) error {
 		flags:      FINACK,
 		sourcePort: sock.LocalPort,
 		destPort:   sock.RemotePort,
-		seqNum:     sock.cumWriteUNA,
-		ackNum:     sock.readBuffer.NXT + sock.baseAck,
+		seqNum:     seq,
+		ackNum:     ack,
 		window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
 	}
 	p := packet.marshallTCPPacket()
@@ -1026,11 +1042,14 @@ func (sock *NormalSocket) VClose(n *node.Node, t *TCPStack) error {
 				sock.unackedMtx.Lock()
 				delete(sock.unackedFINs, receivedAck)
 				sock.unackedMtx.Unlock()
+				sock.stateMtx.Lock()
 				if sock.state == FIN_WAIT_1 {
 					sock.state = FIN_WAIT_2
 				} else if sock.state == LAST_ACK {
 					t.deleteTCB(sock)
 				}
+				sock.stateMtx.Unlock()
+
 				return
 			}
 		}
@@ -1081,6 +1100,7 @@ func (t *TCPStack) SendFile(file *os.File, addr netip.Addr, port uint16, n *node
 		fmt.Println(err)
 		return err
 	}
+	time.Sleep(50 * time.Millisecond)
 	err = sock.VClose(n, t)
 	return err
 }
@@ -1110,15 +1130,20 @@ func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error
 		for {
 			sock.stateMtx.Lock()
 			if sock.state == CLOSE_WAIT {
+				sock.stateMtx.Unlock()
+				time.Sleep(50 * time.Millisecond)
 				sock.VClose(n, t)
 				break
 			}
 			sock.stateMtx.Unlock()
-			err := sock.VRead(uint16(1<<16-1), file)
-			if err != nil {
-				fmt.Println(err)
+			if (sock.readBuffer.NXT-1-sock.readBuffer.LBR+WINDOW_SIZE)%WINDOW_SIZE > 0 {
+				err := sock.VRead(uint16(1<<16-1), file)
+				if err != nil {
+					fmt.Println(err)
+				}
 			}
 		}
+		fmt.Println("finished receiving file")
 	}()
 	return nil
 }

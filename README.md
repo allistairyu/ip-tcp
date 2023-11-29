@@ -82,3 +82,8 @@ Most of these are done in the direct way
 
 The only issue at the moment is zero window probing, which seems to end up in a loop of meaningless acks sometimes. However, this is not that frequent and does not seem to affect other functionality.
 
+**Packet Capture**
+- 3-way handshake: frames 1-3
+- sent/ack segment: frames 4-5
+- retransmitted segment: frame 130
+- connection teardown: frames 1834-1837
