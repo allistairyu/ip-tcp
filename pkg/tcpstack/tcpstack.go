@@ -508,7 +508,7 @@ func (sock *NormalSocket) SenderThread(n *node.Node, t *TCPStack) {
 }
 
 func (sock *NormalSocket) recomputeRTO(RTT float64) {
-	fmt.Printf("curr rto: %f\n", sock.RTO)
+	// fmt.Printf("curr rto: %f\n", sock.RTO)
 	if RTT < 0 { // then we're indicating just expiration
 		sock.RTO = 2 * sock.RTO
 		sock.RTO = max(RTO_MIN, min(RTO_MAX, sock.RTO))
@@ -826,7 +826,7 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 			sock.readBuffer.readMtx.Lock()
 
 			if received.Flag&header.TCPFlagFin > 0 {
-				sock.readBuffer.NXT += 1
+				sock.cumReadNXT += 1
 				if sock.state == ESTABLISHED {
 					sock.state = CLOSE_WAIT
 				} else if sock.state == FIN_WAIT_2 {
@@ -997,7 +997,7 @@ func (sock *NormalSocket) VClose(n *node.Node, t *TCPStack) error {
 		flags:      FINACK,
 		sourcePort: sock.LocalPort,
 		destPort:   sock.RemotePort,
-		seqNum:     sock.writeBuffer.UNA + sock.baseSeq,
+		seqNum:     sock.cumWriteUNA,
 		ackNum:     sock.readBuffer.NXT + sock.baseAck,
 		window:     uint16((sock.readBuffer.LBR - sock.readBuffer.NXT + WINDOW_SIZE) % WINDOW_SIZE),
 	}
@@ -1081,7 +1081,8 @@ func (t *TCPStack) SendFile(file *os.File, addr netip.Addr, port uint16, n *node
 		fmt.Println(err)
 		return err
 	}
-	return nil
+	err = sock.VClose(n, t)
+	return err
 }
 
 func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error {
@@ -1109,6 +1110,7 @@ func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error
 		for {
 			sock.stateMtx.Lock()
 			if sock.state == CLOSE_WAIT {
+				sock.VClose(n, t)
 				break
 			}
 			sock.stateMtx.Unlock()
