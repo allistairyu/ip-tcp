@@ -120,7 +120,7 @@ type NormalSocket struct {
 	ClientWindowSize uint16
 	ackChan          chan node.TCPInfo
 	finChan          chan uint32
-	unackedNums      map[uint32]bool
+	unackedNums      map[uint32]int
 	unackedFINs      map[uint32]bool
 	unackedMtx       *sync.Mutex
 	earlyPQ          pq.EarlyPriorityQueue
@@ -316,7 +316,7 @@ func (t *TCPStack) VConnect(destAddr netip.Addr, destPort uint16, n *node.Node) 
 	// newSocket.chans = make(map[uint32]chan bool)
 	newSocket.ackChan = make(chan node.TCPInfo, 100) // is 100 the right size
 	newSocket.finChan = make(chan uint32)
-	newSocket.unackedNums = make(map[uint32]bool)
+	newSocket.unackedNums = make(map[uint32]int)
 	newSocket.earlyPQ = make(pq.EarlyPriorityQueue, 0)
 	newSocket.index = 0
 	newSocket.unackedMtx = &sync.Mutex{}
@@ -382,7 +382,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 		normalChan:     make(chan node.TCPInfo, 100),
 		ackChan:        make(chan node.TCPInfo, 100),
 		finChan:        make(chan uint32),
-		unackedNums:    make(map[uint32]bool),
+		unackedNums:    make(map[uint32]int),
 		unackedFINs:    make(map[uint32]bool),
 		earlyPQ:        make(pq.EarlyPriorityQueue, 0),
 		index:          0,
@@ -419,7 +419,7 @@ func (lsock *ListenSocket) VAccept(t *TCPStack, n *node.Node) (*NormalSocket, er
 
 	n.HandleSend(sk.LocalAddr, packet, 6)
 	newSocket.cumReadNXT = ci.SeqNum + 1
-	newSocket.cumWriteUNA = newSocket.baseSeq
+	newSocket.cumWriteUNA = newSocket.baseSeq + 1
 
 	// wait for final packet to establish TCP
 	for !(ci.Flag == header.TCPFlagAck && ci.SocketTableKey.RemotePort == lsock.localPort) {
@@ -538,7 +538,7 @@ func (sock *NormalSocket) retransThread(window *Window, n *node.Node, t *TCPStac
 			// send + restart timer
 			sock.recomputeRTO(-1)
 			window.winLock.Lock()
-			if window.head != nil {
+			if sock.ClientWindowSize > 0 && window.head != nil { // should not be retransmitting a packet if should be zwp instead
 				if window.head.expectedAck != 0 { // update the packet with new ack nums + window size
 					// first check if head is still dummy
 					win_node := window.head
@@ -659,7 +659,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 			probe := probe_packet.marshallTCPPacket()
 			expectedAck := distUNA + sock.cumWriteUNA
 			sock.unackedMtx.Lock()
-			sock.unackedNums[expectedAck] = true
+			sock.unackedNums[expectedAck] = 0
 			sock.unackedMtx.Unlock()
 
 			n.HandleSend(sock.RemoteAddr, probe, 6)
@@ -679,6 +679,7 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 							// wait just restart then lol
 							packet.payload = packet.payload[1:]
 							sock.packetDoneChan <- true
+							skip_probe = true
 							defer sock.slidingWindow(packet, n, t)
 							return
 						} else {
@@ -695,17 +696,20 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 		}
 	normal:
 		if (sock.ClientWindowSize > 0) && (bytesToSend > 0) && ((window.head != nil && window.head.next == nil) || window.tail.index-window.head.next.index < WINDOW_SIZE) {
+			//fmt.Printf("window size: %d\n", sock.ClientWindowSize)
 			sock.writeBuffer.NXT = (sock.writeBuffer.NXT + uint32(bytesToSend)) % WINDOW_SIZE
 			distUNA = (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
 			expectedAck := distUNA + sock.cumWriteUNA
 			sock.unackedMtx.Lock()
-			sock.unackedNums[expectedAck] = true
+			sock.unackedNums[expectedAck] = 0
 			sock.unackedMtx.Unlock()
 
 			p := window.tail.packet.marshallTCPPacket()
 			window.tail.retrans = false
 			window.tail.lastSent = time.Now()
 			n.HandleSend(sock.RemoteAddr, p, 6)
+			// i think ideal is to adjust client window size here as predicted, just in case delays occur?
+			sock.ClientWindowSize -= uint16(len(p) - 20)
 			if first {
 				first = false
 				sock.resetTicker()
@@ -745,7 +749,14 @@ func (sock *NormalSocket) slidingWindow(packet TCPPacket, n *node.Node, t *TCPSt
 			received := <-sock.ackChan
 			receivedAck := received.AckNum
 			sock.unackedMtx.Lock()
-			delete(sock.unackedNums, receivedAck)
+			//delete(sock.unackedNums, receivedAck)
+			if sock.unackedNums[receivedAck] == 0 {
+				// first time seeing
+				sock.unackedNums[receivedAck] += 1
+			} else {
+				// dup ack
+				continue
+			}
 			sock.unackedMtx.Unlock()
 
 			sock.ClientWindowSize = received.WindowSize
@@ -797,9 +808,12 @@ func (sock *NormalSocket) ReceiverThread(n *node.Node, t *TCPStack) {
 			}
 			// here we received an ack packet in response to what we sent
 			if _, ok := sock.unackedNums[received.AckNum]; ok { // TODO: possible that this received ACK num is in map but not an ACK in response to what we sent
-				sock.ackChan <- received
-				sock.unackedMtx.Unlock()
-				continue
+				if len(received.Payload) == 0 {
+					// not a dupack, new stuff
+					sock.ackChan <- received
+					sock.unackedMtx.Unlock()
+					continue
+				}
 			}
 			sock.unackedMtx.Unlock()
 
@@ -929,11 +943,16 @@ func (sock *NormalSocket) VWrite(message []byte) error {
 	}
 	sock.stateMtx.Unlock()
 	bytesSent := uint32(0)
+	new_message := true
 	for bytesSent < uint32(len(message)) {
 		space := (sock.writeBuffer.UNA - 1 - sock.writeBuffer.LBW + WINDOW_SIZE) % WINDOW_SIZE
 		if !sock.notFirstWrite {
-			space = WINDOW_SIZE - 1
+			space = WINDOW_SIZE - 1 - sock.writeBuffer.LBW
 			sock.notFirstWrite = true
+			new_message = false
+		} else if new_message {
+			new_message = false
+			space = WINDOW_SIZE - 1 - sock.writeBuffer.LBW
 		}
 		to_write := min(uint32(len(message))-bytesSent, space, uint32(node.MaxMessageSize-40)) // max is maxmsg - ip header - tcp header
 
@@ -963,6 +982,7 @@ func (sock *NormalSocket) VRead(numbytes uint16, file *os.File) error {
 	}
 	sock.stateMtx.Unlock()
 	num_buf := (sock.readBuffer.NXT - 1 - sock.readBuffer.LBR + WINDOW_SIZE) % WINDOW_SIZE
+	//fmt.Printf("amount to read: %d\n", num_buf)
 
 	// block if nothing to read
 	sock.readBuffer.readMtx.Lock()
@@ -1001,11 +1021,11 @@ func (sock *NormalSocket) VClose(n *node.Node, t *TCPStack) error {
 	distUNA := (sock.writeBuffer.NXT - sock.writeBuffer.UNA + WINDOW_SIZE) % WINDOW_SIZE
 	seq := distUNA + sock.cumWriteUNA
 	ack := sock.cumReadNXT
-	if !sock.notFirstWrite {
-		sock.readBuffer.NXT++
-		seq++
-		sock.notFirstWrite = true
-	}
+	// if !sock.notFirstWrite {
+	// 	sock.readBuffer.NXT++
+	// 	seq++
+	// 	sock.notFirstWrite = true
+	// }
 	packet := TCPPacket{
 		sourceIp:   sock.LocalAddr,
 		destIp:     sock.RemoteAddr,
@@ -1136,7 +1156,9 @@ func (t *TCPStack) ReceiveFile(filename string, port uint16, n *node.Node) error
 				break
 			}
 			sock.stateMtx.Unlock()
+			//			fmt.Printf("nxt: %d, lbr: %d\n", sock.readBuffer.NXT, sock.readBuffer.LBR)
 			if (sock.readBuffer.NXT-1-sock.readBuffer.LBR+WINDOW_SIZE)%WINDOW_SIZE > 0 {
+				//fmt.Println("go")
 				err := sock.VRead(uint16(1<<16-1), file)
 				if err != nil {
 					fmt.Println(err)
